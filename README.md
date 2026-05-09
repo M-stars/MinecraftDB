@@ -95,6 +95,4 @@ SQL 引擎测试位于 `src/test/java/com/minecraftdb/sql/`。
 - Forge 47.4+
 - Java 17+
 
-## 许可证
 
-MIT License
