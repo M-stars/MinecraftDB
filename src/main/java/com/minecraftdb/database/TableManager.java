@@ -1,0 +1,248 @@
+package com.minecraftdb.database;
+
+import com.minecraftdb.sql.ast.ColumnDefinition;
+import com.minecraftdb.storage.BlockOperator;
+import com.minecraftdb.storage.CoordinateAllocator;
+import com.minecraftdb.storage.WoolDecoder;
+import com.minecraftdb.storage.WoolEncoder;
+import com.minecraftdb.util.WorldUtils;
+import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.DyeColor;
+import net.minecraft.world.level.block.Blocks;
+
+import java.util.*;
+
+/**
+ * Manages table data operations: CRUD for rows using wool block encoding.
+ */
+public class TableManager {
+
+    private final ServerLevel level;
+    private final CoordinateAllocator coordAllocator;
+    private final BlockOperator blockOp;
+    private final DatabaseManager dbManager;
+
+    public TableManager(ServerLevel level, CoordinateAllocator coordAllocator, DatabaseManager dbManager) {
+        this.level = level;
+        this.coordAllocator = coordAllocator;
+        this.blockOp = new BlockOperator(level);
+        this.dbManager = dbManager;
+    }
+
+    public BlockOperator getBlockOperator() {
+        return blockOp;
+    }
+
+    // === Table lifecycle ===
+
+    public boolean tableExists(String tableName) {
+        return coordAllocator.getCoords(tableName) != null;
+    }
+
+    public Set<String> listTables() {
+        return coordAllocator.getTableNames();
+    }
+
+    public void createTable(String tableName, List<ColumnDefinition> columns) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.allocate(tableName, columns.size());
+
+        // Place bedrock markers at table boundaries (Y=0)
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int x = coords.xStart; x <= coords.xEnd; x++) {
+            pos.set(x, 0, 0);
+            level.setBlock(pos, Blocks.BEDROCK.defaultBlockState(), 3);
+        }
+
+        // Initialize first row area with white wool
+        WorldUtils.fillAreaWool(level, coords.xStart, coords.xEnd,
+                WorldUtils.DATA_START_Y, WorldUtils.DATA_MAX_Y,
+                1, 1, DyeColor.WHITE);
+
+        dbManager.saveTableRegistry();
+        blockOp.flush();
+    }
+
+    public void dropTable(String tableName) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
+        if (coords == null) return;
+
+        // Clear all blocks in the table's area
+        WorldUtils.fillAreaWool(level, coords.xStart, coords.xEnd,
+                WorldUtils.DATA_START_Y, WorldUtils.DATA_MAX_Y,
+                0, (int) Math.min(coords.nextZ, 10000), DyeColor.WHITE);
+
+        coordAllocator.remove(tableName);
+        dbManager.saveTableRegistry();
+    }
+
+    // === Row operations ===
+
+    public void insertRow(String tableName, List<ColumnDefinition> schema, Map<String, Object> rowData) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
+        if (coords == null) throw new IllegalStateException("Table not found: " + tableName);
+
+        long z = coords.nextZ++;
+
+        for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
+            ColumnDefinition colDef = schema.get(colIdx);
+            Object value = rowData.get(colDef.name);
+            int x = coords.xStart + colIdx;
+
+            List<DyeColor> colorSeq = encodeValue(value, colDef.dataType);
+            for (int dy = 0; dy < colorSeq.size(); dy++) {
+                blockOp.writeWool(x, WorldUtils.DATA_START_Y + dy, (int) z, colorSeq.get(dy));
+            }
+            // Fill remaining Y layers with white (null placeholder)
+            for (int dy = colorSeq.size(); dy < getMaxYForType(colDef.dataType); dy++) {
+                blockOp.writeWool(x, WorldUtils.DATA_START_Y + dy, (int) z, DyeColor.WHITE);
+            }
+        }
+
+        blockOp.flush();
+    }
+
+    public List<Map<String, Object>> readAllRows(String tableName, List<ColumnDefinition> schema) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
+        if (coords == null) return Collections.emptyList();
+
+        List<Map<String, Object>> rows = new ArrayList<>();
+        long maxZ = coords.nextZ;
+
+        for (int z = 1; z < maxZ; z++) {
+            Map<String, Object> row = readRow(tableName, schema, z);
+            if (row != null && !row.isEmpty()) {
+                rows.add(row);
+            }
+        }
+
+        return rows;
+    }
+
+    public Map<String, Object> readRow(String tableName, List<ColumnDefinition> schema, int z) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
+        if (coords == null) return null;
+
+        Map<String, Object> row = new LinkedHashMap<>();
+        boolean hasData = false;
+
+        for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
+            ColumnDefinition colDef = schema.get(colIdx);
+            int x = coords.xStart + colIdx;
+
+            List<DyeColor> colors = new ArrayList<>();
+            for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
+                DyeColor color = blockOp.readWool(x, y, z);
+                if (color == null || color == DyeColor.WHITE) break;
+                colors.add(color);
+            }
+
+            if (!colors.isEmpty()) hasData = true;
+
+            Object value = decodeValue(colors, colDef.dataType);
+            row.put(colDef.name, value);
+        }
+
+        return hasData ? row : null;
+    }
+
+    public void updateRow(String tableName, List<ColumnDefinition> schema, int rowIndex, Map<String, Object> newData) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
+        if (coords == null) throw new IllegalStateException("Table not found: " + tableName);
+
+        int z = rowIndex + 1; // Z starts at 1
+
+        for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
+            ColumnDefinition colDef = schema.get(colIdx);
+            Object value = newData.get(colDef.name);
+            int x = coords.xStart + colIdx;
+
+            // Clear existing column data
+            for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
+                blockOp.writeWool(x, y, z, DyeColor.WHITE);
+            }
+
+            // Write new data
+            List<DyeColor> colorSeq = encodeValue(value, colDef.dataType);
+            for (int dy = 0; dy < colorSeq.size(); dy++) {
+                blockOp.writeWool(x, WorldUtils.DATA_START_Y + dy, z, colorSeq.get(dy));
+            }
+        }
+
+        blockOp.flush();
+    }
+
+    public void deleteRow(String tableName, List<ColumnDefinition> schema, int rowIndex) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
+        if (coords == null) return;
+
+        int z = rowIndex + 1;
+
+        // Overwrite with white wool (marking as empty)
+        for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
+            int x = coords.xStart + colIdx;
+            for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
+                blockOp.writeWool(x, y, z, DyeColor.WHITE);
+                DyeColor current = blockOp.readWool(x, y, z);
+                if (current == null || current == DyeColor.WHITE) break;
+            }
+        }
+
+        blockOp.flush();
+    }
+
+    // === Encoding/Decoding helpers ===
+
+    private List<DyeColor> encodeValue(Object value, String dataType) {
+        if (value == null) return WoolEncoder.encodeNull();
+
+        String typeBase = dataType.split("\\(")[0].toUpperCase();
+
+        return switch (typeBase) {
+            case "INT", "INTEGER" -> WoolEncoder.encodeInt(((Number) value).intValue());
+            case "BIGINT" -> WoolEncoder.encodeBigInt(((Number) value).longValue());
+            case "FLOAT" -> WoolEncoder.encodeFloat(((Number) value).floatValue());
+            case "DOUBLE" -> WoolEncoder.encodeDouble(((Number) value).doubleValue());
+            case "BOOLEAN", "BOOL" -> WoolEncoder.encodeBoolean((Boolean) value);
+            case "VARCHAR", "TEXT", "STRING" -> WoolEncoder.encodeString(value.toString());
+            case "DATE", "DATETIME" -> {
+                if (value instanceof Number n) {
+                    yield WoolEncoder.encodeTimestamp(n.longValue());
+                }
+                yield WoolEncoder.encodeString(value.toString());
+            }
+            default -> WoolEncoder.encodeString(value.toString());
+        };
+    }
+
+    private Object decodeValue(List<DyeColor> colors, String dataType) {
+        if (colors.isEmpty()) return null;
+        if (colors.get(0) == DyeColor.BLACK) return null;
+
+        String typeBase = dataType.split("\\(")[0].toUpperCase();
+
+        return switch (typeBase) {
+            case "INT", "INTEGER" -> WoolDecoder.decodeInt(colors);
+            case "BIGINT" -> WoolDecoder.decodeBigInt(colors);
+            case "FLOAT" -> WoolDecoder.decodeFloat(colors);
+            case "DOUBLE" -> WoolDecoder.decodeDouble(colors);
+            case "BOOLEAN", "BOOL" -> WoolDecoder.decodeBoolean(colors.get(0));
+            case "VARCHAR", "TEXT", "STRING" -> WoolDecoder.decodeString(colors);
+            case "DATE", "DATETIME" -> WoolDecoder.decodeTimestamp(colors);
+            default -> WoolDecoder.decodeString(colors);
+        };
+    }
+
+    private int getMaxYForType(String dataType) {
+        String typeBase = dataType.split("\\(")[0].toUpperCase();
+        return switch (typeBase) {
+            case "BOOL", "BOOLEAN" -> 1;
+            case "INT", "INTEGER" -> 12;
+            case "BIGINT" -> 22;
+            case "FLOAT", "DOUBLE" -> 20;
+            case "VARCHAR" -> 255;
+            case "TEXT" -> 255;
+            default -> 20;
+        };
+    }
+}

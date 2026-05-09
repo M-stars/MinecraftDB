@@ -1,0 +1,11 @@
+{
+    "commands.db.success": "§a[DB] Query executed successfully.",
+    "commands.db.error": "§c[DB] Error: %s",
+    "commands.db.rows_affected": "§a[DB] %d row(s) affected.",
+    "commands.db.table_created": "§a[DB] Table '%s' created.",
+    "commands.db.table_dropped": "§a[DB] Table '%s' dropped.",
+    "commands.db.no_result": "§7[DB] Query returned no results.",
+    "commands.db.transaction_begin": "§a[DB] Transaction started.",
+    "commands.db.transaction_commit": "§a[DB] Transaction committed.",
+    "commands.db.transaction_rollback": "§e[DB] Transaction rolled back."
+}
