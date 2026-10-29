@@ -10,6 +10,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.event.ServerChatEvent;
+import net.minecraftforge.event.entity.player.PlayerEvent;
 import net.minecraftforge.event.server.ServerStartingEvent;
 import net.minecraftforge.event.server.ServerStoppingEvent;
 import net.minecraftforge.eventbus.api.IEventBus;
@@ -118,6 +119,19 @@ public class MinecraftDB {
 
         // 执行 SQL
         DatabaseCommand.handleCliInput(player, message);
+    }
+
+    /**
+     * 玩家退出：回滚其未提交的数据库事务并清理 CLI 会话，防止泄漏
+     */
+    @SubscribeEvent
+    public void onPlayerLoggedOut(PlayerEvent.PlayerLoggedOutEvent event) {
+        if (databaseManager != null) {
+            databaseManager.getTransactionManager().endSession("player:" + event.getEntity().getUUID());
+        }
+        if (event.getEntity() instanceof ServerPlayer sp) {
+            CliSessionManager.exit(sp);
+        }
     }
 
     public static DatabaseManager getDatabaseManager() {

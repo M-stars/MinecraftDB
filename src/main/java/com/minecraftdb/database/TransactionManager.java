@@ -106,6 +106,24 @@ public class TransactionManager {
         return currentTxn() != null;
     }
 
+    /**
+     * 结束客户端会话（玩家退出服务器 / TCP 连接断开）：
+     * 存在未提交事务时立即回滚并移除，防止会话事务与 WAL 写入句柄永久泄漏。
+     * 必须在主线程调用。
+     */
+    public void endSession(String sessionId) {
+        Transaction txn = activeTxns.remove(sessionId);
+        if (txn == null) return;
+        txnCloseWal(txn);
+        if (walEnabled) {
+            deleteWALFile(txn.id);
+        }
+        for (int i = txn.walEntries.size() - 1; i >= 0; i--) {
+            restoreEntry(txn.walEntries.get(i));
+        }
+        releaseAllLocks(txn);
+    }
+
     // === 事务生命周期 ===
 
     public void begin() {

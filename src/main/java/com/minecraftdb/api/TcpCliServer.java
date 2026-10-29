@@ -88,6 +88,8 @@ public class TcpCliServer {
     }
 
     private void handleClient(Socket client) {
+        // 每条连接一个会话：BEGIN/COMMIT/ROLLBACK 在本连接内独立生效
+        String session = "tcp:" + client.getRemoteSocketAddress();
         try (
             InputStream is = client.getInputStream();
             OutputStream os = client.getOutputStream();
@@ -95,8 +97,6 @@ public class TcpCliServer {
             PrintWriter writer = new PrintWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8), true)
         ) {
             client.setSoTimeout(IDLE_TIMEOUT_MILLIS); // 空闲超时：read 抛 SocketTimeoutException 断开
-            // 每条连接一个会话：BEGIN/COMMIT/ROLLBACK 在本连接内独立生效
-            String session = "tcp:" + client.getRemoteSocketAddress();
             String dbName = dbManager.getDatabaseName();
             writer.println("");
             writer.println("╔══════════════════════════════════════════╗");
@@ -145,8 +145,10 @@ public class TcpCliServer {
                 executeAndPrint(writer, session, trimmed);
             }
         } catch (IOException e) {
-            // client disconnected
+            // client disconnected / idle timeout
         } finally {
+            // 连接结束：回滚该会话未提交的事务，防止泄漏
+            dbManager.getTransactionManager().endSession(session);
             try { client.close(); } catch (IOException ignored) {}
         }
     }

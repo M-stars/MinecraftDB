@@ -169,14 +169,20 @@ public class WhereClause {
         }
     }
 
-    /** col LIKE pattern（% 任意长度、_ 单个字符） */
+    /** col [NOT] LIKE pattern（% 任意长度、_ 单个字符） */
     public static final class LikeCondition extends Leaf {
         private final String pattern;
+        private final boolean negated;
         private Pattern compiled;
 
         public LikeCondition(String column, String pattern) {
+            this(column, pattern, false);
+        }
+
+        public LikeCondition(String column, String pattern, boolean negated) {
             super(column);
             this.pattern = pattern;
+            this.negated = negated;
         }
 
         @Override
@@ -186,7 +192,8 @@ public class WhereClause {
             if (compiled == null) {
                 compiled = likeToRegex(unquote(pattern));
             }
-            return compiled.matcher(actual.toString()).matches();
+            boolean matched = compiled.matcher(actual.toString()).matches();
+            return negated ? !matched : matched;
         }
 
         private static Pattern likeToRegex(String pattern) {

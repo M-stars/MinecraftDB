@@ -204,6 +204,13 @@ public class SqlExecutor {
                     String colName = targetColumns.get(i);
                     ColumnDefinition colDef = findColumn(schema, colName);
                     Object parsedValue = parseValue(valueGroup.get(i), colDef.dataType);
+                    if (parsedValue == null && colDef.isPrimaryKey()) {
+                        throw new IllegalStateException("PRIMARY KEY column '" + colDef.name + "' cannot be NULL");
+                    }
+                    if (parsedValue == null && colDef.autoIncrement) {
+                        // MySQL 语义：自增列显式给 NULL 等价于未提供，生成下一个自增值
+                        continue;
+                    }
                     if (parsedValue != null && (colDef.isPrimaryKey() || colDef.autoIncrement)) {
                         Long dup = findDuplicateZ(stmt.tableName, schema, colDef, parsedValue, -1);
                         if (dup != null) {
@@ -227,11 +234,13 @@ public class SqlExecutor {
                     }
                 }
 
-                // NOT NULL / PRIMARY KEY 非空校验
+                // NOT NULL / PRIMARY KEY 非空校验（主键隐含 NOT NULL）
                 for (ColumnDefinition colDef : schema) {
-                    if (rowData.get(colDef.name) == null && !colDef.isNullable() && !colDef.isPrimaryKey()) {
+                    if (rowData.get(colDef.name) == null
+                            && (!colDef.isNullable() || colDef.isPrimaryKey())) {
                         throw new IllegalStateException("Column '" + colDef.name
-                                + "' cannot be NULL (NOT NULL constraint)");
+                                + "' cannot be NULL (" + (colDef.isPrimaryKey() ? "PRIMARY KEY" : "NOT NULL")
+                                + " constraint)");
                     }
                 }
 
@@ -319,39 +328,36 @@ public class SqlExecutor {
         boolean aggregateMode = !stmt.groupBy.isEmpty()
                 || items.stream().anyMatch(i -> i.function() != null);
 
-        // ORDER BY：普通模式对表列名校验归一；聚合模式对输出列（label）校验
-        List<SelectStatement.OrderBy> resolvedOrderBy = new ArrayList<>();
-        if (aggregateMode) {
-            Set<String> labels = new LinkedHashSet<>();
+        // ORDER BY 解析：优先匹配输出列（SELECT 别名 / 聚合表达式），
+        // 否则回退为表列名（允许按未出现在 SELECT 中的列排序）。
+        // 两类都存在时：先按表列排物化行，投影后再按输出列稳定排序。
+        List<SelectStatement.OrderBy> labelOrderBy = new ArrayList<>();
+        List<SelectStatement.OrderBy> columnOrderBy = new ArrayList<>();
+        for (SelectStatement.OrderBy ob : stmt.orderBy) {
+            String label = null;
             for (SelectStatement.SelectItem item : items) {
-                labels.add(item.label());
-            }
-            for (SelectStatement.OrderBy ob : stmt.orderBy) {
-                String target = null;
-                for (String label : labels) {
-                    if (label.equalsIgnoreCase(ob.column())) {
-                        target = label;
-                        break;
-                    }
+                if (item.label().equalsIgnoreCase(ob.column())
+                        || item.column().equalsIgnoreCase(ob.column())) {
+                    label = item.label();
+                    break;
                 }
-                if (target == null) {
+            }
+            if (label != null) {
+                labelOrderBy.add(new SelectStatement.OrderBy(label, ob.ascending()));
+            } else {
+                if (aggregateMode) {
                     return QueryResult.error("Unknown column '" + ob.column()
                             + "' in ORDER BY（聚合查询只能按输出列排序）");
                 }
-                resolvedOrderBy.add(new SelectStatement.OrderBy(target, ob.ascending()));
-            }
-        } else {
-            for (SelectStatement.OrderBy ob : stmt.orderBy) {
                 ColumnDefinition cd = findColumn(schema, ob.column());
                 if (cd == null) {
                     return QueryResult.error("Unknown column '" + ob.column() + "' in ORDER BY");
                 }
-                resolvedOrderBy.add(new SelectStatement.OrderBy(cd.name, ob.ascending()));
+                columnOrderBy.add(new SelectStatement.OrderBy(cd.name, ob.ascending()));
             }
         }
-
-        boolean needsSort = !resolvedOrderBy.isEmpty();
-        boolean postPaging = needsSort || aggregateMode; // 排序/聚合：先收集全部命中行，事后再切片
+        boolean needsSort = !labelOrderBy.isEmpty() || !columnOrderBy.isEmpty();
+        boolean postPaging = needsSort || aggregateMode || stmt.distinct; // 去重/排序/聚合：先收集全部命中行，事后再处理
         // 读取上限：显式 LIMIT 且无需事后分页时直接用作收集上限
         int hardCap = !postPaging && stmt.limit != null
                 ? stmt.limit
@@ -384,6 +390,17 @@ public class SqlExecutor {
                 break;
             }
             collected.add(row);
+        }
+
+        // ---- 按表列排序物化行（隐藏排序列），再投影 ----
+        if (!columnOrderBy.isEmpty()) {
+            collected.sort((a, b) -> {
+                for (SelectStatement.OrderBy ob : columnOrderBy) {
+                    int cmp = compareValues(a.get(ob.column()), b.get(ob.column()));
+                    if (cmp != 0) return ob.ascending() ? cmp : -cmp;
+                }
+                return 0;
+            });
         }
 
         String message = "Selected %d row(s)";
@@ -458,13 +475,22 @@ public class SqlExecutor {
             }
         }
 
-        // ---- 排序（聚合模式按输出列下标排序） ----
-        if (needsSort) {
-            int[] idxs = new int[resolvedOrderBy.size()];
-            boolean[] ascs = new boolean[resolvedOrderBy.size()];
-            for (int i = 0; i < resolvedOrderBy.size(); i++) {
-                SelectStatement.OrderBy ob = resolvedOrderBy.get(i);
-                idxs[i] = aggregateMode ? outColumns.indexOf(ob.column()) : outColumns.indexOf(ob.column());
+        // ---- DISTINCT：必须在 LIMIT/OFFSET 切片之前去重（SQL 语义） ----
+        if (stmt.distinct) {
+            LinkedHashMap<String, List<Object>> unique = new LinkedHashMap<>();
+            for (List<Object> r : rows) {
+                unique.putIfAbsent(r.toString(), r);
+            }
+            rows = new ArrayList<>(unique.values());
+        }
+
+        // ---- 按输出列排序（别名/聚合；Collections.sort 稳定，可与表列排序叠加） ----
+        if (!labelOrderBy.isEmpty()) {
+            int[] idxs = new int[labelOrderBy.size()];
+            boolean[] ascs = new boolean[labelOrderBy.size()];
+            for (int i = 0; i < labelOrderBy.size(); i++) {
+                SelectStatement.OrderBy ob = labelOrderBy.get(i);
+                idxs[i] = outColumns.indexOf(ob.column());
                 ascs[i] = ob.ascending();
             }
             rows.sort((r1, r2) -> {
@@ -484,15 +510,6 @@ public class SqlExecutor {
             int from = stmt.offset != null ? Math.min(stmt.offset, rows.size()) : 0;
             int to = stmt.limit != null ? Math.min(from + stmt.limit, rows.size()) : rows.size();
             rows = new ArrayList<>(rows.subList(from, to));
-        }
-
-        // ---- DISTINCT ----
-        if (stmt.distinct) {
-            LinkedHashMap<String, List<Object>> unique = new LinkedHashMap<>();
-            for (List<Object> r : rows) {
-                unique.putIfAbsent(r.toString(), r);
-            }
-            rows = new ArrayList<>(unique.values());
         }
 
         if (capReached && stmt.limit == null) {
@@ -643,14 +660,23 @@ public class SqlExecutor {
                 }
 
                 if (matches) {
-                    // 主键/自增列被 SET 时检查唯一性（排除本行）
+                    // 校验被 SET 的列：主键/自增列唯一性与非空，其余列 NOT NULL
                     for (ColumnDefinition cd : schema) {
-                        if ((cd.isPrimaryKey() || cd.autoIncrement) && parsedAssignments.containsKey(cd.name)) {
-                            Object v = parsedAssignments.get(cd.name);
-                            if (v == null) {
+                        if (!parsedAssignments.containsKey(cd.name)) continue;
+                        Object v = parsedAssignments.get(cd.name);
+                        if (v == null) {
+                            if (cd.isPrimaryKey() || cd.autoIncrement) {
                                 throw new IllegalStateException("Column '" + cd.name
-                                        + "' cannot be set to NULL (" + (cd.isPrimaryKey() ? "PRIMARY KEY" : "AUTO_INCREMENT") + ")");
+                                        + "' cannot be set to NULL ("
+                                        + (cd.isPrimaryKey() ? "PRIMARY KEY" : "AUTO_INCREMENT") + ")");
                             }
+                            if (!cd.isNullable()) {
+                                throw new IllegalStateException("Column '" + cd.name
+                                        + "' cannot be set to NULL (NOT NULL constraint)");
+                            }
+                            continue;
+                        }
+                        if (cd.isPrimaryKey() || cd.autoIncrement) {
                             Long dup = findDuplicateZ(stmt.tableName, schema, cd, v, z);
                             if (dup != null) {
                                 throw new IllegalStateException("Duplicate value '" + v

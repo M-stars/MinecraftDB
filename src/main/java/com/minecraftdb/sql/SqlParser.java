@@ -518,8 +518,15 @@ public class SqlParser {
         boolean negatedIn = false;
         if (peek().type() == TokenType.NOT) {
             advance();
-            expect(TokenType.IN);
-            negatedIn = true;
+            if (peek().type() == TokenType.IN) {
+                advance();
+                negatedIn = true;
+            } else if (peek().type() == TokenType.LIKE) {
+                advance();
+                return new WhereClause.LikeCondition(column, parseValue(), true);
+            } else {
+                throw new ParseException("Expected IN or LIKE after NOT, got: " + peek().value());
+            }
         } else if (peek().type() == TokenType.IN) {
             advance();
         } else {

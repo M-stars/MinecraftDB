@@ -85,6 +85,14 @@ class WhereClauseTest {
     }
 
     @Test
+    @DisplayName("NOT LIKE")
+    void notLike() {
+        assertFalse(where("name NOT LIKE 'Ali%'").evaluate(COLS, List.of(1, "Alice", 3)));
+        assertTrue(where("name NOT LIKE 'Ali%'").evaluate(COLS, List.of(1, "Bob", 3)));
+        assertFalse(where("name NOT LIKE '_lice'").evaluate(COLS, List.of(1, "Alice", 3)));
+    }
+
+    @Test
     @DisplayName("NULL 参与 IN/LIKE/比较恒为 false（unknown 语义）")
     void nullSemantics() {
         assertFalse(where("name IN ('Alice')").evaluate(COLS, Arrays.asList(1, null, 3)));
