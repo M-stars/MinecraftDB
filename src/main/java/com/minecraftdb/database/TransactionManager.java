@@ -7,7 +7,9 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.DyeColor;
 
+import java.io.BufferedWriter;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -20,17 +22,20 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * ACID 事务管理器（WAL + 锁管理）。
  *
  * WAL 设计：每个事务一个文件 config/minecraftdb/wal/<世界名>/txn_<id>.wal，
- * 逐行 JSON 追加：
+ * 逐行 JSON：
  *   BEGIN 行:  {"type":"BEGIN","txnId":1}
  *   数据行:    {"type":"OP","txnId":1,"table":"users","x":1,"y":2,"z":3,"oldColor":"ORANGE","newColor":"AIR"}
  *   COMMIT 行: {"type":"COMMIT","txnId":1}
  *
- * 提交流程：先追加 COMMIT 行再删除文件。崩溃恢复时：
+ * 写入经 BufferedWriter 缓冲：每条 OP 只做一次 write 调用（无逐条打开/关闭文件的
+ * syscall 开销），由 flushWALBuffer() 在语句边界把缓冲推到操作系统。
+ *
+ * 提交流程：追加 COMMIT 行并 flush 后关闭、删除文件。若 flush/写 COMMIT 失败，
+ * 保留文件、抛出异常、事务保持开启（COMMIT 行不存在 → 崩溃恢复会回滚）。
+ * 崩溃恢复时：
  *   - 文件存在且包含 COMMIT 行 → 事务已提交，保留数据，删除文件
  *   - 否则 → 未提交，按逆序把每个 OP 的方块恢复为 oldColor（null 表示空气）
- *
- * 回滚不需要读文件：内存中的 walEntries 已包含本事务全部已应用变更，
- * 逆序恢复即可；WAL 文件只服务于崩溃恢复。
+ *   - 解析损坏的文件改名保留为 .corrupt，不做部分恢复也不删除
  */
 public class TransactionManager {
 
@@ -47,6 +52,9 @@ public class TransactionManager {
     private final ThreadLocal<Transaction> currentTxn = new ThreadLocal<>();
     private final Map<Long, Transaction> activeTransactions = new ConcurrentHashMap<>();
     private long nextTxnId = 1;
+
+    // 当前线程事务的 WAL 写入器（与 currentTxn 同为线程绑定）
+    private final ThreadLocal<BufferedWriter> walWriter = new ThreadLocal<>();
 
     public TransactionManager(ServerLevel level) {
         this.level = level;
@@ -72,7 +80,14 @@ public class TransactionManager {
         activeTransactions.put(txn.id, txn);
 
         if (walEnabled) {
-            writeWALLine(txn.id, WALEntry.begin(txn.id), true);
+            try {
+                openWALWriter(txn.id, true);
+                writeWALLine(WALEntry.begin(txn.id));
+                flushWALBuffer();
+            } catch (IOException e) {
+                closeWALWriter();
+                throw new RuntimeException("WAL 初始化失败，无法开始事务", e);
+            }
         }
     }
 
@@ -83,8 +98,15 @@ public class TransactionManager {
         }
 
         if (walEnabled) {
-            // 先落盘 COMMIT 再删除文件：崩溃窗口内恢复程序会认为事务已提交（保留数据）
-            writeWALLine(txn.id, WALEntry.commit(txn.id), false);
+            try {
+                writeWALLine(WALEntry.commit(txn.id));
+                flushWALBuffer();
+            } catch (IOException e) {
+                // 保留 WAL 文件（无 COMMIT 行），崩溃恢复时按未提交回滚
+                closeWALWriter();
+                throw new RuntimeException("WAL 提交失败，事务未提交，请 ROLLBACK 后重试", e);
+            }
+            closeWALWriter();
             deleteWALFile(txn.id);
         }
 
@@ -99,12 +121,14 @@ public class TransactionManager {
             throw new IllegalStateException("没有活跃事务");
         }
 
+        closeWALWriter();
+        if (walEnabled) {
+            deleteWALFile(txn.id);
+        }
+
         // 逆序恢复所有已应用的方块变更
         for (int i = txn.walEntries.size() - 1; i >= 0; i--) {
             restoreEntry(txn.walEntries.get(i));
-        }
-        if (walEnabled) {
-            deleteWALFile(txn.id);
         }
 
         releaseAllLocks(txn);
@@ -125,7 +149,9 @@ public class TransactionManager {
     /**
      * 记录一次方块变更，必须在变更落盘之前调用。
      * oldColor/newColor 为 DyeColor 枚举名，null 表示空气。
-     * 无论 WAL 是否启用都写入内存列表（回滚需要）；WAL 启用时同步追加到文件。
+     * 无论 WAL 是否启用都写入内存列表（回滚需要）；WAL 启用时写入文件缓冲。
+     * IO 失败直接抛出：调用方（BlockOperator → SqlExecutor）会中止并回滚当前事务，
+     * 避免"日志缺失但数据已写"的静默不一致。
      */
     public void logBlockChange(String tableName, int x, int y, int z, String oldColor, String newColor) {
         Transaction txn = currentTxn.get();
@@ -134,7 +160,29 @@ public class TransactionManager {
         WALEntry entry = WALEntry.op(txn.id, tableName, x, y, z, oldColor, newColor);
         txn.walEntries.add(entry);
         if (walEnabled) {
-            writeWALLine(txn.id, entry, false);
+            try {
+                if (walWriter.get() == null) {
+                    openWALWriter(txn.id, false);
+                }
+                writeWALLine(entry);
+            } catch (IOException e) {
+                throw new RuntimeException("WAL 写入失败，中止当前事务", e);
+            }
+        }
+    }
+
+    /**
+     * 把 WAL 缓冲推到操作系统。方块批量写入（语句边界）后调用，
+     * 保证已应用到世界的数据都有对应的持久日志。
+     */
+    public void flushWALBuffer() {
+        BufferedWriter writer = walWriter.get();
+        if (writer != null) {
+            try {
+                writer.flush();
+            } catch (IOException e) {
+                throw new RuntimeException("WAL 刷写失败，中止当前事务", e);
+            }
         }
     }
 
@@ -211,17 +259,28 @@ public class TransactionManager {
 
     // === WAL 文件操作 ===
 
-    private void writeWALLine(long txnId, WALEntry entry, boolean truncate) {
-        try {
-            Path file = walDir.resolve("txn_" + txnId + ".wal");
-            if (truncate) {
-                Files.writeString(file, gson.toJson(entry) + System.lineSeparator(),
-                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
-            } else {
-                Files.writeString(file, gson.toJson(entry) + System.lineSeparator(),
-                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-            }
-        } catch (IOException ignored) {}
+    private void openWALWriter(long txnId, boolean truncate) throws IOException {
+        closeWALWriter();
+        Path file = walDir.resolve("txn_" + txnId + ".wal");
+        walWriter.set(Files.newBufferedWriter(file, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                truncate ? StandardOpenOption.TRUNCATE_EXISTING : StandardOpenOption.APPEND));
+    }
+
+    private void writeWALLine(WALEntry entry) throws IOException {
+        BufferedWriter writer = walWriter.get();
+        writer.write(gson.toJson(entry));
+        writer.write(System.lineSeparator());
+    }
+
+    private void closeWALWriter() {
+        BufferedWriter writer = walWriter.get();
+        if (writer != null) {
+            try {
+                writer.close();
+            } catch (IOException ignored) {}
+            walWriter.remove();
+        }
     }
 
     private void deleteWALFile(long txnId) {
@@ -232,6 +291,7 @@ public class TransactionManager {
 
     /**
      * 服务端启动时恢复未完成的事务（在主线程、任何数据读取之前调用）。
+     * 解析损坏的文件改名为 .corrupt 保留待查，不做部分恢复也不删除。
      */
     public void recoverFromWAL() {
         if (!walEnabled) return;
@@ -240,29 +300,44 @@ public class TransactionManager {
             if (!Files.exists(walDir)) return;
 
             try (var files = Files.list(walDir)) {
-                files.filter(f -> f.getFileName().toString().startsWith("txn_"))
+                files.filter(f -> f.getFileName().toString().startsWith("txn_")
+                                  && f.getFileName().toString().endsWith(".wal"))
                      .forEach(f -> {
                          try {
                              List<WALEntry> entries = new ArrayList<>();
                              boolean committed = false;
+                             boolean corrupt = false;
                              for (String line : Files.readAllLines(f)) {
                                  if (line.isBlank()) continue;
-                                 WALEntry e = gson.fromJson(line, WALEntry.class);
-                                 if (e == null) continue;
-                                 if ("COMMIT".equals(e.type)) {
-                                     committed = true;
+                                 try {
+                                     WALEntry e = gson.fromJson(line, WALEntry.class);
+                                     if (e == null) {
+                                         corrupt = true;
+                                         break;
+                                     }
+                                     if ("COMMIT".equals(e.type)) {
+                                         committed = true;
+                                         break;
+                                     }
+                                     if ("OP".equals(e.type)) {
+                                         entries.add(e);
+                                     }
+                                 } catch (Exception parseError) {
+                                     corrupt = true;
                                      break;
                                  }
-                                 if ("OP".equals(e.type)) {
-                                     entries.add(e);
-                                 }
                              }
-                             if (!committed) {
+                             if (!corrupt && !committed) {
                                  for (int i = entries.size() - 1; i >= 0; i--) {
                                      restoreEntry(entries.get(i));
                                  }
                              }
-                             Files.deleteIfExists(f);
+                             if (corrupt) {
+                                 Files.move(f, f.resolveSibling(f.getFileName() + ".corrupt"),
+                                         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                             } else {
+                                 Files.deleteIfExists(f);
+                             }
                          } catch (Exception ignored) {}
                      });
             }
@@ -278,7 +353,6 @@ public class TransactionManager {
         public final List<String> acquiredTableWriteLocks = new ArrayList<>();
         public final List<RowLockKey> acquiredRowLocks = new ArrayList<>();
         public final List<WALEntry> walEntries = new ArrayList<>();
-        public final Map<String, Long> snapshotVersions = new HashMap<>();
 
         public Transaction(long id) {
             this.id = id;

@@ -87,6 +87,10 @@ public class BlockOperator {
         while ((pb = pendingQueue.poll()) != null) {
             applyWrite(pb.pos(), pb.color());
         }
+        // 语句边界：把本批变更对应的 WAL 缓冲推到操作系统
+        if (txnManager != null) {
+            txnManager.flushWALBuffer();
+        }
     }
 
     /**
