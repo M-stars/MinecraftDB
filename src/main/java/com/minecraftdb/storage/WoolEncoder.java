@@ -24,11 +24,12 @@ public final class WoolEncoder {
 
     public static List<DyeColor> encodeInt(int value) {
         List<DyeColor> result = new ArrayList<>();
-        if (value < 0) {
+        long v = value; // 用 long 承接，Integer.MIN_VALUE 取负溢出时会还原成正确的量级
+        if (v < 0) {
             result.add(ColorCode.NEGATIVE);
-            value = -value;
+            v = -v;
         }
-        String digits = String.valueOf(value);
+        String digits = Long.toString(v);
         for (char c : digits.toCharArray()) {
             result.add(ColorCode.fromDigit(c - '0'));
         }
@@ -40,12 +41,12 @@ public final class WoolEncoder {
 
     public static List<DyeColor> encodeBigInt(long value) {
         List<DyeColor> result = new ArrayList<>();
-        if (value < 0) {
+        java.math.BigInteger v = java.math.BigInteger.valueOf(value);
+        if (v.signum() < 0) {
             result.add(ColorCode.NEGATIVE);
-            value = -value;
+            v = v.negate();
         }
-        String digits = String.valueOf(value);
-        for (char c : digits.toCharArray()) {
+        for (char c : v.toString().toCharArray()) {
             result.add(ColorCode.fromDigit(c - '0'));
         }
         if (result.isEmpty()) result.add(ColorCode.ZERO);

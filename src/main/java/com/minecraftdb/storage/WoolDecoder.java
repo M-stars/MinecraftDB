@@ -34,8 +34,10 @@ public final class WoolDecoder {
 
         if (digits.isEmpty()) return 0;
         try {
-            int val = Integer.parseInt(digits.toString());
-            return negative ? -val : val;
+            long val = Long.parseLong(digits.toString());
+            long signed = negative ? -val : val;
+            if (signed < Integer.MIN_VALUE || signed > Integer.MAX_VALUE) return null;
+            return (int) signed;
         } catch (NumberFormatException e) {
             return null;
         }
@@ -65,6 +67,10 @@ public final class WoolDecoder {
             long val = Long.parseLong(digits.toString());
             return negative ? -val : val;
         } catch (NumberFormatException e) {
+            // Long.MIN_VALUE 的量级 9223372036854775808 超出 long 正数表示范围
+            if (negative && "9223372036854775808".contentEquals(digits)) {
+                return Long.MIN_VALUE;
+            }
             return null;
         }
     }
