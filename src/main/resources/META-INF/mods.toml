@@ -1,14 +1,14 @@
 modLoader="javafml"
 loaderVersion="${loader_version_range}"
 license="MIT"
-issueTrackerURL="https://github.com/example/minecraftdb/issues"
+issueTrackerURL="https://github.com/M-stars/MinecraftDB/issues"
 
 [[mods]]
 modId="${mod_id}"
 version="${mod_version}"
 displayName="${mod_name}"
 updateJSONURL=""
-displayURL="https://github.com/example/minecraftdb"
+displayURL="https://github.com/M-stars/MinecraftDB"
 #logoFile=""
 credits=""
 authors="${mod_authors}"
@@ -19,11 +19,11 @@ description='''${mod_description}'''
     mandatory=true
     versionRange="${forge_version_range}"
     ordering="NONE"
-    side="BOTH"
+    side="SERVER"
 
 [[dependencies.${mod_id}]]
     modId="minecraft"
     mandatory=true
     versionRange="${minecraft_version_range}"
     ordering="NONE"
-    side="BOTH"
+    side="SERVER"

@@ -11,11 +11,11 @@ MinecraftDB 利用 Minecraft 世界中的**彩色羊毛块**作为物理存储�
 ## 特性
 
 - **完整 SQL 引擎**：从零构建的词法分析器、递归下降解析器、AST 执行器
-- **DDL 支持**：`CREATE TABLE`、`DROP TABLE`、`ALTER TABLE`、`CREATE INDEX`
-- **DML 支持**：`INSERT`、`SELECT`、`UPDATE`、`DELETE`，支持 `WHERE` 条件和比较运算符
-- **数据类型**：`INT`、`BIGINT`、`FLOAT`、`DOUBLE`、`BOOLEAN`、`VARCHAR(n)`、`TEXT`、`DATE`、`DATETIME`
-- **ACID 事务**：基于 MVCC 的快照隔离，读写锁，WAL 崩溃恢复
-- **三种交互方式**：游戏内 `/db` 命令/CLI 模式、HTTP REST API（端口 25566）、TCP telnet 终端（端口 25567）
+- **DDL 支持**：`CREATE TABLE`、`DROP TABLE`、`ALTER TABLE`、`CREATE INDEX`（索引当前仅元数据，不参与查询计划）
+- **DML 支持**：`INSERT`（支持多组 VALUES 批量插入）、`SELECT`、`UPDATE`、`DELETE`，支持 `WHERE` 条件、比较运算符、`ORDER BY`、`LIMIT`/`OFFSET`
+- **数据类型**：`INT`、`BIGINT`、`FLOAT`、`DOUBLE`、`BOOLEAN`、`VARCHAR(n)`、`TEXT`、`DATE`、`DATETIME`；`NOT NULL` 约束生效
+- **事务**：WAL 落盘 + 崩溃恢复 + 语句级回滚（DDL 非事务性，与常规数据库语义一致）
+- **三种交互方式**：游戏内 `/db` 命令/CLI 模式、HTTP REST API（端口 25566）、TCP telnet 终端（端口 25567，默认仅监听 127.0.0.1）
 - **零新增物品/方块**：只使用原版的羊毛、基岩和金块，注册表完全干净
 
 ## 快速开始
@@ -42,11 +42,11 @@ MinecraftDB 利用 Minecraft 世界中的**彩色羊毛块**作为物理存储�
 
 ```
 GET  /api/v1/health              # 健康检查
-GET  /api/v1/query?sql=SELECT... # 执行查询
-POST /api/v1/execute             # 执行任意 SQL {"sql": "..."}
+GET  /api/v1/query?sql=SELECT... # 执行只读查询（仅 SELECT/SHOW/DESC，写操作返回 405）
+POST /api/v1/execute             # 执行任意 SQL {"sql": "..."}（请求体上限 1MB）
 GET  /api/v1/tables              # 列出所有表
 GET  /api/v1/table/{name}/schema # 获取表结构
-GET  /api/v1/table/{name}/rows   # 分页获取表数据
+GET  /api/v1/table/{name}/rows   # 分页获取表数据（limit/offset，响应含 hasMore）
 ```
 
 ### TCP CLI
@@ -55,7 +55,19 @@ GET  /api/v1/table/{name}/rows   # 分页获取表数据
 telnet localhost 25567
 ```
 
-连接后即可在类 MySQL 终端中执行 SQL。
+连接后即可在类 MySQL 终端中执行 SQL（连接数上限 10，空闲 10 分钟自动断开）。
+
+## SQL 语法速查
+
+```sql
+CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL, age INT);
+INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25), (2, 'Bob', 30);  -- 批量插入
+SELECT * FROM users WHERE age > 18 ORDER BY age DESC LIMIT 10 OFFSET 0;
+UPDATE users SET age = 26 WHERE name = 'Alice';
+DELETE FROM users WHERE id = 1;
+BEGIN; COMMIT; ROLLBACK;
+SHOW TABLES;  DESC users;  SHOW INDEXES FROM users;
+```
 
 ## 配置
 
@@ -71,9 +83,10 @@ telnet localhost 25567
 | `TCP_CLI_PORT` | `25567` | TCP CLI 端口 |
 | `TCP_CLI_BIND_ADDRESS` | `127.0.0.1` | TCP CLI 绑定地址，对外网开放前务必设置 Token |
 | `TCP_CLI_TOKEN` | 空 | TCP CLI 认证 Token，设置后连接需先输入 `auth <token>` |
-| `DATABASE_DEFAULT_WORLD` | `minecraftdb` | 作为数据库的世界名称 |
-| `DATABASE_AUTO_CREATE_WORLD` | `true` | 自动创建数据库世界 |
-| `DATABASE_WAL_ENABLED` | `true` | 启用 WAL |
+| `DATABASE_DEFAULT_WORLD` | `minecraftdb` | 作为数据库的世界名称（找不到时回退主世界） |
+| `DATABASE_WAL_ENABLED` | `true` | 启用 WAL（事务日志与崩溃恢复） |
+| `PERFORMANCE_MAX_SELECT_ROWS` | `10000` | 无 LIMIT 时 SELECT 的物化行数上限 |
+| `PERFORMANCE_BATCH_BLOCK_UPDATES` | `true` | 方块批量写入（关闭后逐块立即落盘，仅调试用） |
 
 ## 技术架构
 
