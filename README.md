@@ -11,10 +11,12 @@ MinecraftDB 利用 Minecraft 世界中的**彩色羊毛块**作为物理存储�
 ## 特性
 
 - **完整 SQL 引擎**：从零构建的词法分析器、递归下降解析器、AST 执行器
-- **DDL 支持**：`CREATE TABLE`、`DROP TABLE`、`ALTER TABLE`、`CREATE INDEX`（索引当前仅元数据，不参与查询计划）
-- **DML 支持**：`INSERT`（支持多组 VALUES 批量插入）、`SELECT`、`UPDATE`、`DELETE`，支持 `WHERE` 条件、比较运算符、`ORDER BY`、`LIMIT`/`OFFSET`
-- **数据类型**：`INT`、`BIGINT`、`FLOAT`、`DOUBLE`、`BOOLEAN`、`VARCHAR(n)`、`TEXT`、`DATE`、`DATETIME`；`NOT NULL` 约束生效
-- **事务**：WAL 落盘 + 崩溃恢复 + 语句级回滚（DDL 非事务性，与常规数据库语义一致）
+- **DDL 支持**：`CREATE TABLE [IF NOT EXISTS]`、`DROP TABLE [IF EXISTS]`、`ALTER TABLE`、`CREATE INDEX`（索引当前仅元数据，不参与查询计划）、`SHOW CREATE TABLE`
+- **DML 支持**：`INSERT`（多组 VALUES 批量插入）、`SELECT`、`UPDATE`、`DELETE`
+- **查询能力**：`WHERE`（AND/OR 优先级、括号、`IS [NOT] NULL`、`[NOT] IN`、`LIKE`）、`ORDER BY`、`LIMIT`/`OFFSET`、`DISTINCT`、聚合函数 `COUNT/SUM/AVG/MIN/MAX` 与 `GROUP BY`
+- **数据完整性**：`NOT NULL`、`PRIMARY KEY`（隐含 NOT NULL 且强制唯一）、`AUTO_INCREMENT`（取最大值+1 并强制唯一）、`DEFAULT`
+- **数据类型**：`INT`、`BIGINT`、`FLOAT`、`DOUBLE`、`BOOLEAN`、`VARCHAR(n)`、`TEXT`、`DATE`、`DATETIME`
+- **会话级事务**：每个玩家/TCP 连接/HTTP 会话独立事务，WAL 落盘 + 崩溃恢复 + 回滚（DDL 非事务性）
 - **三种交互方式**：游戏内 `/db` 命令/CLI 模式、HTTP REST API（端口 25566）、TCP telnet 终端（端口 25567，默认仅监听 127.0.0.1）
 - **零新增物品/方块**：只使用原版的羊毛、基岩和金块，注册表完全干净
 
@@ -49,6 +51,10 @@ GET  /api/v1/table/{name}/schema # 获取表结构
 GET  /api/v1/table/{name}/rows   # 分页获取表数据（limit/offset，响应含 hasMore）
 ```
 
+**HTTP 事务**：默认每个请求独立（等效自动提交）。需要跨请求事务时，携带相同的
+`X-MinecraftDB-Session` 请求头即可：`POST /execute` 发 `BEGIN`，后续请求用同一
+会话头执行语句，最后 `COMMIT`/`ROLLBACK`。
+
 ### TCP CLI
 
 ```bash
@@ -56,18 +62,53 @@ telnet localhost 25567
 ```
 
 连接后即可在类 MySQL 终端中执行 SQL（连接数上限 10，空闲 10 分钟自动断开）。
+每条连接拥有独立事务。
 
 ## SQL 语法速查
 
 ```sql
-CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL, age INT);
-INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25), (2, 'Bob', 30);  -- 批量插入
-SELECT * FROM users WHERE age > 18 ORDER BY age DESC LIMIT 10 OFFSET 0;
-UPDATE users SET age = 26 WHERE name = 'Alice';
-DELETE FROM users WHERE id = 1;
+-- 建表：主键隐含 NOT NULL 且强制唯一；AUTO_INCREMENT 取最大值+1；DEFAULT 填充缺省
+CREATE TABLE IF NOT EXISTS users (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  name VARCHAR(50) NOT NULL,
+  role VARCHAR(20) DEFAULT 'player',
+  score INT DEFAULT 0
+);
+
+-- 批量插入（自增列可省略）
+INSERT INTO users (name, score) VALUES ('Alice', 90), ('Bob', 75), ('Carol', 82);
+
+-- 条件查询：AND/OR 优先级（可加括号）、IS NULL、IN、LIKE
+SELECT * FROM users
+ WHERE (role = 'player' OR score > 80) AND name IS NOT NULL
+ ORDER BY score DESC
+ LIMIT 10 OFFSET 0;
+
+-- 聚合与分组
+SELECT role, COUNT(*) AS cnt, AVG(score) AS avg_score
+  FROM users GROUP BY role ORDER BY cnt DESC;
+
+-- 修改与删除
+UPDATE users SET score = 88 WHERE name IN ('Alice', 'Carol');
+DELETE FROM users WHERE name LIKE 'B%';
+
+-- 事务与会话（每个玩家/TCP 连接/HTTP 会话头独立）
 BEGIN; COMMIT; ROLLBACK;
-SHOW TABLES;  DESC users;  SHOW INDEXES FROM users;
+
+-- 元数据
+SHOW TABLES;  DESC users;  SHOW INDEXES FROM users;  SHOW CREATE TABLE users;
 ```
+
+## 已知限制
+
+- 不支持 JOIN、子查询、HAVING、UNION 与 `SET col = col + 1` 表达式
+- 仅支持单列 PRIMARY KEY；索引为元数据，不参与查询计划
+- 所有语句在服务端主线程串行执行且锁为线程级可重入，
+  一个会话未提交的写入对其他会话可见（无 MVCC 快照隔离）
+- 聚合/排序查询需要物化全部命中行，受 `PERFORMANCE_MAX_SELECT_ROWS` 保护
+- PRIMARY KEY/AUTO_INCREMENT 唯一性检查为列级全扫描，
+  每次相关写入多一次列级读取，这是方块存储介质的合理代价
+- 大表 DROP/DELETE 会在单 tick 内执行大量方块清除，可能造成卡顿
 
 ## 配置
 
