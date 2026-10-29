@@ -12,6 +12,7 @@ public abstract class Statement {
         DELETE,
         SHOW_TABLES,
         DESC_TABLE,
+        SHOW_CREATE_TABLE,
         BEGIN,
         COMMIT,
         ROLLBACK,

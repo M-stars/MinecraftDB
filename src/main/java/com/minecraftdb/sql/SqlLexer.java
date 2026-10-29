@@ -182,6 +182,7 @@ public class SqlLexer {
         ORDER, BY, LIMIT, OFFSET, ASC,
         IN, IS, LIKE,
         IF, EXISTS, DEFAULT, AUTO_INCREMENT,
+        GROUP, AS, DISTINCT,
         VARCHAR, INT, BIGINT, TEXT, BOOLEAN, FLOAT, DOUBLE, DATE, DATETIME,
 
         // Identifiers and literals
@@ -249,6 +250,9 @@ public class SqlLexer {
             MAP.put("exists", TokenType.EXISTS);
             MAP.put("default", TokenType.DEFAULT);
             MAP.put("auto_increment", TokenType.AUTO_INCREMENT);
+            MAP.put("group", TokenType.GROUP);
+            MAP.put("as", TokenType.AS);
+            MAP.put("distinct", TokenType.DISTINCT);
             MAP.put("desc", TokenType.DESC);
             MAP.put("varchar", TokenType.VARCHAR);
             MAP.put("int", TokenType.INT);

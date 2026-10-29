@@ -52,6 +52,7 @@ public class SqlExecutor {
             case DELETE -> executeDelete((DeleteStatement) stmt);
             case SHOW_TABLES -> executeShowTables();
             case DESC_TABLE -> executeDescTable((DescTableStatement) stmt);
+            case SHOW_CREATE_TABLE -> executeShowCreateTable((ShowCreateTableStatement) stmt);
             case BEGIN -> executeBegin();
             case COMMIT -> executeCommit();
             case ROLLBACK -> executeRollback();
@@ -308,21 +309,53 @@ public class SqlExecutor {
             columnNames.add(cd.name);
         }
 
-        // ORDER BY 列名校验与归一（大小写不敏感）
-        List<SelectStatement.OrderBy> resolvedOrderBy = new ArrayList<>();
-        for (SelectStatement.OrderBy ob : stmt.orderBy) {
-            ColumnDefinition cd = findColumn(schema, ob.column());
-            if (cd == null) {
-                return QueryResult.error("Unknown column '" + ob.column() + "' in ORDER BY");
+        List<SelectStatement.SelectItem> items = stmt.selectItems;
+        if (items == null) { // 旧构造器：从 columns 推导
+            items = new ArrayList<>();
+            for (String c : stmt.columns) {
+                items.add(new SelectStatement.SelectItem(null, c, c));
             }
-            resolvedOrderBy.add(new SelectStatement.OrderBy(cd.name, ob.ascending()));
+        }
+        boolean aggregateMode = !stmt.groupBy.isEmpty()
+                || items.stream().anyMatch(i -> i.function() != null);
+
+        // ORDER BY：普通模式对表列名校验归一；聚合模式对输出列（label）校验
+        List<SelectStatement.OrderBy> resolvedOrderBy = new ArrayList<>();
+        if (aggregateMode) {
+            Set<String> labels = new LinkedHashSet<>();
+            for (SelectStatement.SelectItem item : items) {
+                labels.add(item.label());
+            }
+            for (SelectStatement.OrderBy ob : stmt.orderBy) {
+                String target = null;
+                for (String label : labels) {
+                    if (label.equalsIgnoreCase(ob.column())) {
+                        target = label;
+                        break;
+                    }
+                }
+                if (target == null) {
+                    return QueryResult.error("Unknown column '" + ob.column()
+                            + "' in ORDER BY（聚合查询只能按输出列排序）");
+                }
+                resolvedOrderBy.add(new SelectStatement.OrderBy(target, ob.ascending()));
+            }
+        } else {
+            for (SelectStatement.OrderBy ob : stmt.orderBy) {
+                ColumnDefinition cd = findColumn(schema, ob.column());
+                if (cd == null) {
+                    return QueryResult.error("Unknown column '" + ob.column() + "' in ORDER BY");
+                }
+                resolvedOrderBy.add(new SelectStatement.OrderBy(cd.name, ob.ascending()));
+            }
         }
 
-        // 读取上限：显式 LIMIT 优先，否则用配置的全局上限
-        int hardCap = stmt.limit != null
+        boolean needsSort = !resolvedOrderBy.isEmpty();
+        boolean postPaging = needsSort || aggregateMode; // 排序/聚合：先收集全部命中行，事后再切片
+        // 读取上限：显式 LIMIT 且无需事后分页时直接用作收集上限
+        int hardCap = !postPaging && stmt.limit != null
                 ? stmt.limit
                 : ModConfig.PERFORMANCE_MAX_SELECT_ROWS;
-        boolean needsSort = !resolvedOrderBy.isEmpty();
 
         // 流式逐行扫描：WHERE 在读取阶段求值，避免全量物化
         List<Map<String, Object>> collected = new ArrayList<>();
@@ -342,59 +375,210 @@ public class SqlExecutor {
             }
             matchedCount++;
 
-            if (needsSort) {
-                // 需要排序：先收齐全部命中行（受 hardCap 保护），排序后再切片
-                if (collected.size() >= hardCap) {
-                    capReached = true;
-                    break;
-                }
-                collected.add(row);
-            } else {
-                // 无排序：跳过 offset 个命中行，收满即提前结束扫描
+            if (!postPaging) {
+                // 无排序无聚合：跳过 offset 个命中行，收满即提前结束扫描
                 if (stmt.offset != null && matchedCount <= stmt.offset) continue;
-                if (collected.size() >= hardCap) {
-                    capReached = true;
-                    break;
+            }
+            if (collected.size() >= hardCap) {
+                capReached = true;
+                break;
+            }
+            collected.add(row);
+        }
+
+        String message = "Selected %d row(s)";
+        List<String> outColumns;
+        List<List<Object>> rows = new ArrayList<>();
+
+        if (aggregateMode) {
+            // ---- 校验 SELECT 项与 GROUP BY ----
+            Set<String> groupByResolved = new LinkedHashSet<>();
+            for (String g : stmt.groupBy) {
+                ColumnDefinition cd = findColumn(schema, g);
+                if (cd == null) {
+                    return QueryResult.error("Unknown column '" + g + "' in GROUP BY");
                 }
-                collected.add(row);
+                groupByResolved.add(cd.name);
+            }
+            for (SelectStatement.SelectItem item : items) {
+                if (item.function() == null) {
+                    ColumnDefinition cd = findColumn(schema, item.column());
+                    if (cd == null) {
+                        return QueryResult.error("Unknown column '" + item.column() + "' in SELECT");
+                    }
+                    if (!groupByResolved.contains(cd.name)) {
+                        return QueryResult.error("Column '" + item.column()
+                                + "' must appear in GROUP BY or be used in an aggregate");
+                    }
+                } else if (!"*".equals(item.column())
+                        && findColumn(schema, item.column()) == null) {
+                    return QueryResult.error("Unknown column '" + item.column()
+                            + "' in " + item.function());
+                }
+            }
+
+            // ---- 分组（无 GROUP BY 时整表一个组） ----
+            Map<String, List<Map<String, Object>>> groups = new LinkedHashMap<>();
+            if (groupByResolved.isEmpty()) {
+                groups.put("", collected);
+            } else {
+                for (Map<String, Object> row : collected) {
+                    StringBuilder key = new StringBuilder();
+                    for (String g : groupByResolved) {
+                        key.append(String.valueOf(row.get(g))).append('\u0000');
+                    }
+                    groups.computeIfAbsent(key.toString(), k -> new ArrayList<>()).add(row);
+                }
+            }
+
+            outColumns = new ArrayList<>();
+            for (SelectStatement.SelectItem item : items) {
+                outColumns.add(item.label());
+            }
+            for (List<Map<String, Object>> groupRows : groups.values()) {
+                List<Object> out = new ArrayList<>();
+                for (SelectStatement.SelectItem item : items) {
+                    if (item.function() == null) {
+                        out.add(groupRows.isEmpty() ? null
+                                : groupRows.get(0).get(resolveSchemaName(schema, item.column())));
+                    } else {
+                        out.add(computeAggregate(item.function(), item.column(), schema, groupRows));
+                    }
+                }
+                rows.add(out);
+            }
+        } else {
+            outColumns = stmt.isSelectAll() ? columnNames : stmt.columns;
+            for (Map<String, Object> row : collected) {
+                List<Object> projected = new ArrayList<>();
+                for (String col : outColumns) {
+                    projected.add(row.getOrDefault(col, null));
+                }
+                rows.add(projected);
             }
         }
 
+        // ---- 排序（聚合模式按输出列下标排序） ----
         if (needsSort) {
-            collected.sort((a, b) -> {
-                for (SelectStatement.OrderBy ob : resolvedOrderBy) {
-                    int cmp = compareValues(a.get(ob.column()), b.get(ob.column()));
-                    if (cmp != 0) return ob.ascending() ? cmp : -cmp;
+            int[] idxs = new int[resolvedOrderBy.size()];
+            boolean[] ascs = new boolean[resolvedOrderBy.size()];
+            for (int i = 0; i < resolvedOrderBy.size(); i++) {
+                SelectStatement.OrderBy ob = resolvedOrderBy.get(i);
+                idxs[i] = aggregateMode ? outColumns.indexOf(ob.column()) : outColumns.indexOf(ob.column());
+                ascs[i] = ob.ascending();
+            }
+            rows.sort((r1, r2) -> {
+                for (int i = 0; i < idxs.length; i++) {
+                    int idx = idxs[i];
+                    Object a = idx >= 0 && idx < r1.size() ? r1.get(idx) : null;
+                    Object b = idx >= 0 && idx < r2.size() ? r2.get(idx) : null;
+                    int cmp = compareValues(a, b);
+                    if (cmp != 0) return ascs[i] ? cmp : -cmp;
                 }
                 return 0;
             });
         }
 
-        int from = stmt.offset != null && needsSort ? Math.min(stmt.offset, collected.size()) : 0;
-        int to = stmt.limit != null && needsSort ? Math.min(from + stmt.limit, collected.size()) : collected.size();
-        List<Map<String, Object>> pagedRows = collected.subList(from, to);
+        // ---- 事后分页（LIMIT/OFFSET） ----
+        if (postPaging) {
+            int from = stmt.offset != null ? Math.min(stmt.offset, rows.size()) : 0;
+            int to = stmt.limit != null ? Math.min(from + stmt.limit, rows.size()) : rows.size();
+            rows = new ArrayList<>(rows.subList(from, to));
+        }
 
-        // Project columns
-        List<String> selectColumns = stmt.isSelectAll() ? columnNames : stmt.columns;
+        // ---- DISTINCT ----
+        if (stmt.distinct) {
+            LinkedHashMap<String, List<Object>> unique = new LinkedHashMap<>();
+            for (List<Object> r : rows) {
+                unique.putIfAbsent(r.toString(), r);
+            }
+            rows = new ArrayList<>(unique.values());
+        }
 
-        String message = "Selected " + pagedRows.size() + " row(s)";
         if (capReached && stmt.limit == null) {
             message += "（达到 PERFORMANCE_MAX_SELECT_ROWS 上限，结果已截断）";
         }
-        QueryResult result = QueryResult.ok(message);
-        result.setColumns(selectColumns);
-
-        List<List<Object>> rows = new ArrayList<>();
-        for (Map<String, Object> row : pagedRows) {
-            List<Object> projected = new ArrayList<>();
-            for (String col : selectColumns) {
-                projected.add(row.getOrDefault(col, null));
-            }
-            rows.add(projected);
-        }
+        QueryResult result = QueryResult.ok(String.format(message, rows.size()));
+        result.setColumns(outColumns);
         result.setRows(rows);
-        result.setRowCount(pagedRows.size());
+        result.setRowCount(rows.size());
 
+        return result;
+    }
+
+    private String resolveSchemaName(List<ColumnDefinition> schema, String col) {
+        ColumnDefinition cd = findColumn(schema, col);
+        return cd != null ? cd.name : col;
+    }
+
+    /** 聚合计算：COUNT/SUM/AVG/MIN/MAX；SUM/AVG 只统计数值行，MIN/MAX 兼容字符串 */
+    private Object computeAggregate(String fn, String col, List<ColumnDefinition> schema,
+                                    List<Map<String, Object>> rows) {
+        if ("COUNT".equals(fn)) {
+            if ("*".equals(col)) return rows.size();
+            String name = resolveSchemaName(schema, col);
+            long n = 0;
+            for (Map<String, Object> row : rows) {
+                if (row.get(name) != null) n++;
+            }
+            return n;
+        }
+        String name = resolveSchemaName(schema, col);
+        long numericCount = 0;
+        double sum = 0;
+        boolean allIntegral = true;
+        Object min = null;
+        Object max = null;
+        for (Map<String, Object> row : rows) {
+            Object v = row.get(name);
+            if (v == null) continue;
+            if (v instanceof Number n) {
+                numericCount++;
+                sum += n.doubleValue();
+                if (!(v instanceof Integer || v instanceof Long)) allIntegral = false;
+                if (min == null || n.doubleValue() < ((Number) min).doubleValue()) min = v;
+                if (max == null || n.doubleValue() > ((Number) max).doubleValue()) max = v;
+            } else {
+                if (min == null || v.toString().compareTo(min.toString()) < 0) min = v;
+                if (max == null || v.toString().compareTo(max.toString()) > 0) max = v;
+            }
+        }
+        return switch (fn) {
+            case "SUM" -> numericCount == 0 ? null : (allIntegral ? (Object) (long) sum : sum);
+            case "AVG" -> numericCount == 0 ? null : sum / numericCount;
+            case "MIN" -> min;
+            case "MAX" -> max;
+            default -> null;
+        };
+    }
+
+    private QueryResult executeShowCreateTable(ShowCreateTableStatement stmt) {
+        List<ColumnDefinition> schema = dbManager.getSchemaManager().getSchema(stmt.tableName);
+        if (schema == null) {
+            return QueryResult.error("Table '" + stmt.tableName + "' does not exist");
+        }
+
+        StringBuilder sb = new StringBuilder("CREATE TABLE ").append(stmt.tableName).append(" (\n");
+        for (int i = 0; i < schema.size(); i++) {
+            ColumnDefinition cd = schema.get(i);
+            sb.append("  `").append(cd.name).append("` ").append(cd.dataType);
+            if (cd.autoIncrement) sb.append(" AUTO_INCREMENT");
+            if (cd.isPrimaryKey()) {
+                sb.append(" NOT NULL PRIMARY KEY");
+            } else if (!cd.isNullable()) {
+                sb.append(" NOT NULL");
+            }
+            if (cd.defaultValue != null) {
+                sb.append(" DEFAULT ").append(cd.defaultValue);
+            }
+            sb.append(i < schema.size() - 1 ? "," : "").append("\n");
+        }
+        sb.append(");");
+
+        QueryResult result = QueryResult.ok("1 row(s)");
+        result.setColumns(List.of("Table", "Create Table"));
+        result.setRows(List.of(List.of(stmt.tableName, sb.toString())));
+        result.setRowCount(1);
         return result;
     }
 

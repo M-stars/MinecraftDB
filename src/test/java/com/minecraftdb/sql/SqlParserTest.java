@@ -270,4 +270,39 @@ class SqlParserTest {
     void parseIncomplete() {
         assertThrows(SqlParser.ParseException.class, () -> parse("SELECT * FROM"));
     }
+
+    @Test
+    @DisplayName("解析聚合函数与 GROUP BY")
+    void parseAggregateAndGroupBy() {
+        SelectStatement stmt = (SelectStatement) parse(
+            "SELECT category, COUNT(*), AVG(price) FROM products WHERE price > 0 GROUP BY category ORDER BY COUNT(*) DESC LIMIT 5");
+        assertNotNull(stmt.selectItems);
+        assertEquals(3, stmt.selectItems.size());
+        assertNull(stmt.selectItems.get(0).function());
+        assertEquals("category", stmt.selectItems.get(0).column());
+        assertEquals("COUNT", stmt.selectItems.get(1).function());
+        assertEquals("*", stmt.selectItems.get(1).column());
+        assertEquals("AVG", stmt.selectItems.get(2).function());
+        assertEquals("price", stmt.selectItems.get(2).column());
+        assertEquals(List.of("category"), stmt.groupBy);
+        assertEquals(1, stmt.orderBy.size());
+        assertEquals(5, stmt.limit);
+    }
+
+    @Test
+    @DisplayName("解析 DISTINCT 与 AS 别名")
+    void parseDistinctAndAlias() {
+        SelectStatement stmt = (SelectStatement) parse(
+            "SELECT DISTINCT category AS cat FROM products");
+        assertTrue(stmt.distinct);
+        assertEquals("cat", stmt.selectItems.get(0).label());
+        assertEquals("category", stmt.selectItems.get(0).column());
+    }
+
+    @Test
+    @DisplayName("解析 SHOW CREATE TABLE")
+    void parseShowCreateTable() {
+        ShowCreateTableStatement stmt = (ShowCreateTableStatement) parse("SHOW CREATE TABLE users");
+        assertEquals("users", stmt.tableName);
+    }
 }

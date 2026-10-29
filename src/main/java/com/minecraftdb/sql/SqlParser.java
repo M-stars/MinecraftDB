@@ -7,7 +7,9 @@ import com.minecraftdb.sql.ast.*;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 public class SqlParser {
 
@@ -47,15 +49,25 @@ public class SqlParser {
     private SelectStatement parseSelect() {
         expect(TokenType.SELECT);
 
+        boolean distinct = false;
+        if (peek().type() == TokenType.DISTINCT) {
+            distinct = true;
+            advance();
+        }
+
         List<String> columns = new ArrayList<>();
+        List<SelectStatement.SelectItem> items = new ArrayList<>();
         if (peek().type() == TokenType.STAR) {
             columns.add("*");
+            items.add(new SelectStatement.SelectItem(null, "*", "*"));
             advance();
         } else {
-            columns.add(parseIdentifier());
+            items.add(parseSelectItem());
+            columns.add(items.get(items.size() - 1).label());
             while (peek().type() == TokenType.COMMA) {
                 advance();
-                columns.add(parseIdentifier());
+                items.add(parseSelectItem());
+                columns.add(items.get(items.size() - 1).label());
             }
         }
 
@@ -65,6 +77,17 @@ public class SqlParser {
         WhereClause whereClause = null;
         if (peek().type() == TokenType.WHERE) {
             whereClause = parseWhereClause();
+        }
+
+        List<String> groupBy = new ArrayList<>();
+        if (peek().type() == TokenType.GROUP) {
+            advance();
+            expect(TokenType.BY);
+            groupBy.add(parseIdentifier());
+            while (peek().type() == TokenType.COMMA) {
+                advance();
+                groupBy.add(parseIdentifier());
+            }
         }
 
         List<SelectStatement.OrderBy> orderBy = new ArrayList<>();
@@ -95,11 +118,72 @@ public class SqlParser {
         }
 
         expectOptional(TokenType.SEMICOLON);
-        return new SelectStatement(columns, tableName, whereClause, orderBy, limit, offset);
+        return new SelectStatement(columns, tableName, whereClause, items, groupBy, distinct, orderBy, limit, offset);
+    }
+
+    private static final Set<String> AGGREGATE_FUNCTIONS =
+            Set.of("COUNT", "SUM", "AVG", "MIN", "MAX");
+
+    private SelectStatement.SelectItem parseSelectItem() {
+        Token first = advance();
+        String function = null;
+        String column;
+
+        if (first.type() == TokenType.IDENTIFIER && peek().type() == TokenType.LPAREN
+                && AGGREGATE_FUNCTIONS.contains(first.value().toUpperCase(Locale.ROOT))) {
+            function = first.value().toUpperCase(Locale.ROOT);
+            advance(); // LPAREN
+            if (peek().type() == TokenType.STAR) {
+                advance();
+                column = "*";
+                if (!function.equals("COUNT")) {
+                    throw new ParseException("* is only allowed in COUNT(*)");
+                }
+            } else {
+                column = parseIdentifier();
+            }
+            expect(TokenType.RPAREN);
+        } else {
+            column = tokenAsIdentifier(first);
+        }
+
+        String label = function != null ? function + "(" + column + ")" : column;
+        if (peek().type() == TokenType.AS) {
+            advance();
+            label = parseIdentifier();
+        }
+        return new SelectStatement.SelectItem(function, column, label);
+    }
+
+    /** 支持把数据类型关键字等用作列名的逻辑与 parseIdentifier 保持一致 */
+    private String tokenAsIdentifier(Token t) {
+        if (t.type() == TokenType.IDENTIFIER || isDataTypeToken(t.type())
+                || t.type() == TokenType.INDEX || t.type() == TokenType.INDEXES || t.type() == TokenType.TABLES) {
+            return t.value();
+        }
+        throw new ParseException("Expected identifier, got: " + t.value() + " (" + t.type() + ")");
     }
 
     private SelectStatement.OrderBy parseOrderByItem() {
-        String column = parseIdentifier();
+        String column;
+        Token first = advance();
+        if (first.type() == TokenType.IDENTIFIER && peek().type() == TokenType.LPAREN
+                && AGGREGATE_FUNCTIONS.contains(first.value().toUpperCase(Locale.ROOT))) {
+            // ORDER BY COUNT(*) / SUM(price) 等，与输出列 label 对应
+            String fn = first.value().toUpperCase(Locale.ROOT);
+            advance(); // LPAREN
+            String col;
+            if (peek().type() == TokenType.STAR) {
+                advance();
+                col = "*";
+            } else {
+                col = parseIdentifier();
+            }
+            expect(TokenType.RPAREN);
+            column = fn + "(" + col + ")";
+        } else {
+            column = tokenAsIdentifier(first);
+        }
         boolean ascending = true;
         if (peek().type() == TokenType.ASC) {
             advance();
@@ -323,6 +407,12 @@ public class SqlParser {
             advance();
             expectOptional(TokenType.SEMICOLON);
             return new ShowTablesStatement();
+        } else if (peek().type() == TokenType.CREATE) {
+            advance();
+            expect(TokenType.TABLE);
+            String tableName = parseIdentifier();
+            expectOptional(TokenType.SEMICOLON);
+            return new ShowCreateTableStatement(tableName);
         } else if (peek().type() == TokenType.INDEXES) {
             advance();
             expect(TokenType.FROM);
@@ -330,7 +420,7 @@ public class SqlParser {
             expectOptional(TokenType.SEMICOLON);
             return new ShowIndexesStatement(tableName);
         }
-        throw new ParseException("Expected TABLES or INDEXES after SHOW, got: " + peek().value());
+        throw new ParseException("Expected TABLES, CREATE TABLE or INDEXES after SHOW, got: " + peek().value());
     }
 
     // === DESC ===
