@@ -54,11 +54,7 @@ public class TableManager {
             level.setBlock(pos, Blocks.BEDROCK.defaultBlockState(), 3);
         }
 
-        // Initialize first row area with white wool
-        WorldUtils.fillAreaWool(level, coords.xStart, coords.xEnd,
-                WorldUtils.DATA_START_Y, WorldUtils.DATA_MAX_Y,
-                1, 1, DyeColor.WHITE);
-
+        // 数据区保持空气：空气 = 列数据结束符，写入数据时再放羊毛
         dbManager.saveTableRegistry();
         blockOp.flush();
     }
@@ -68,9 +64,9 @@ public class TableManager {
         if (coords == null) return;
 
         // Clear all blocks in the table's area
-        WorldUtils.fillAreaWool(level, coords.xStart, coords.xEnd,
+        WorldUtils.fillAreaAir(level, coords.xStart, coords.xEnd,
                 WorldUtils.DATA_START_Y, WorldUtils.DATA_MAX_Y,
-                0, (int) Math.min(coords.nextZ, 10000), DyeColor.WHITE);
+                0, (int) Math.min(coords.nextZ, 10000));
 
         coordAllocator.remove(tableName);
         dbManager.saveTableRegistry();
@@ -83,6 +79,7 @@ public class TableManager {
         if (coords == null) throw new IllegalStateException("Table not found: " + tableName);
 
         long z = coords.nextZ++;
+        int maxLayers = WorldUtils.DATA_MAX_Y - WorldUtils.DATA_START_Y + 1;
 
         for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
             ColumnDefinition colDef = schema.get(colIdx);
@@ -90,13 +87,11 @@ public class TableManager {
             int x = coords.xStart + colIdx;
 
             List<DyeColor> colorSeq = encodeValue(value, colDef.dataType);
-            for (int dy = 0; dy < colorSeq.size(); dy++) {
+            int layers = Math.min(colorSeq.size(), maxLayers);
+            for (int dy = 0; dy < layers; dy++) {
                 blockOp.writeWool(x, WorldUtils.DATA_START_Y + dy, (int) z, colorSeq.get(dy));
             }
-            // Fill remaining Y layers with white (null placeholder)
-            for (int dy = colorSeq.size(); dy < getMaxYForType(colDef.dataType); dy++) {
-                blockOp.writeWool(x, WorldUtils.DATA_START_Y + dy, (int) z, DyeColor.WHITE);
-            }
+            // 该列剩余 Y 层保持空气（列数据结束符）
         }
 
         blockOp.flush();
@@ -133,7 +128,8 @@ public class TableManager {
             List<DyeColor> colors = new ArrayList<>();
             for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
                 DyeColor color = blockOp.readWool(x, y, z);
-                if (color == null || color == DyeColor.WHITE) break;
+                // 非羊毛方块（空气等）= 列数据结束；白色羊毛是合法数据（数字 0 / nibble 0x0）
+                if (color == null) break;
                 colors.add(color);
             }
 
@@ -151,20 +147,22 @@ public class TableManager {
         if (coords == null) throw new IllegalStateException("Table not found: " + tableName);
 
         int z = rowIndex + 1; // Z starts at 1
+        int maxLayers = WorldUtils.DATA_MAX_Y - WorldUtils.DATA_START_Y + 1;
 
         for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
             ColumnDefinition colDef = schema.get(colIdx);
             Object value = newData.get(colDef.name);
             int x = coords.xStart + colIdx;
 
-            // Clear existing column data
+            // 整列先清为空气再写新数据，避免新数据比旧数据短时残留上层旧色
             for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
-                blockOp.writeWool(x, y, z, DyeColor.WHITE);
+                blockOp.clearBlock(x, y, z);
             }
 
             // Write new data
             List<DyeColor> colorSeq = encodeValue(value, colDef.dataType);
-            for (int dy = 0; dy < colorSeq.size(); dy++) {
+            int layers = Math.min(colorSeq.size(), maxLayers);
+            for (int dy = 0; dy < layers; dy++) {
                 blockOp.writeWool(x, WorldUtils.DATA_START_Y + dy, z, colorSeq.get(dy));
             }
         }
@@ -178,13 +176,11 @@ public class TableManager {
 
         int z = rowIndex + 1;
 
-        // Overwrite with white wool (marking as empty)
+        // 整行所有列清为空气（空气 = 空行，读取时跳过）
         for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
             int x = coords.xStart + colIdx;
             for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
-                blockOp.writeWool(x, y, z, DyeColor.WHITE);
-                DyeColor current = blockOp.readWool(x, y, z);
-                if (current == null || current == DyeColor.WHITE) break;
+                blockOp.clearBlock(x, y, z);
             }
         }
 
@@ -230,19 +226,6 @@ public class TableManager {
             case "VARCHAR", "TEXT", "STRING" -> WoolDecoder.decodeString(colors);
             case "DATE", "DATETIME" -> WoolDecoder.decodeTimestamp(colors);
             default -> WoolDecoder.decodeString(colors);
-        };
-    }
-
-    private int getMaxYForType(String dataType) {
-        String typeBase = dataType.split("\\(")[0].toUpperCase();
-        return switch (typeBase) {
-            case "BOOL", "BOOLEAN" -> 1;
-            case "INT", "INTEGER" -> 12;
-            case "BIGINT" -> 22;
-            case "FLOAT", "DOUBLE" -> 20;
-            case "VARCHAR" -> 255;
-            case "TEXT" -> 255;
-            default -> 20;
         };
     }
 }

@@ -79,6 +79,10 @@ public final class WorldUtils {
         level.setBlock(pos, state, 3);
     }
 
+    public static void setAir(ServerLevel level, BlockPos pos) {
+        level.removeBlock(pos, false);
+    }
+
     public static void fillWool(ServerLevel level, int xStart, int xEnd, int y, int zStart, int zEnd, DyeColor color) {
         BlockState state = woolState(color);
         for (int x = xStart; x <= xEnd; x++) {
@@ -96,6 +100,18 @@ public final class WorldUtils {
                 for (int z = zStart; z <= zEnd; z++) {
                     pos.set(x, y, z);
                     level.setBlock(pos, state, 3);
+                }
+            }
+        }
+    }
+
+    public static void fillAreaAir(ServerLevel level, int xStart, int xEnd, int yStart, int yEnd, int zStart, int zEnd) {
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        for (int x = xStart; x <= xEnd; x++) {
+            for (int y = yStart; y <= yEnd; y++) {
+                for (int z = zStart; z <= zEnd; z++) {
+                    pos.set(x, y, z);
+                    level.removeBlock(pos, false);
                 }
             }
         }

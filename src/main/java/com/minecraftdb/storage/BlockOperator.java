@@ -42,6 +42,21 @@ public class BlockOperator {
         }
     }
 
+    /**
+     * 将方块清除为空气。color 为 null 的 PendingBlock 表示清除操作。
+     */
+    public void clearBlock(BlockPos pos) {
+        if (batchMode) {
+            pendingQueue.add(new PendingBlock(pos, null));
+        } else {
+            WorldUtils.setAir(level, pos);
+        }
+    }
+
+    public void clearBlock(int x, int y, int z) {
+        clearBlock(new BlockPos(x, y, z));
+    }
+
     public void writeRow(int xStart, int yBase, int z, List<DyeColor>[] columns) {
         for (int col = 0; col < columns.length; col++) {
             List<DyeColor> colorSeq = columns[col];
@@ -67,7 +82,11 @@ public class BlockOperator {
         PendingBlock pb;
         int count = 0;
         while ((pb = pendingQueue.poll()) != null) {
-            WorldUtils.setWool(level, pb.pos, pb.color);
+            if (pb.color() == null) {
+                WorldUtils.setAir(level, pb.pos());
+            } else {
+                WorldUtils.setWool(level, pb.pos(), pb.color());
+            }
             count++;
         }
         if (count > 0) {
@@ -117,12 +136,11 @@ public class BlockOperator {
     // === Bulk operations ===
 
     public void clearArea(int xStart, int xEnd, int yStart, int yEnd, int zStart, int zEnd) {
-        WorldUtils.fillAreaWool(level, xStart, xEnd, yStart, yEnd, zStart, zEnd, DyeColor.WHITE);
+        WorldUtils.fillAreaAir(level, xStart, xEnd, yStart, yEnd, zStart, zEnd);
     }
 
     public void initializeTableArea(int xStart, int xEnd, int zEnd) {
-        WorldUtils.fillAreaWool(level, xStart, xEnd, WorldUtils.DATA_START_Y, WorldUtils.DATA_MAX_Y, 1, (int) zEnd,
-                DyeColor.WHITE);
+        WorldUtils.fillAreaAir(level, xStart, xEnd, WorldUtils.DATA_START_Y, WorldUtils.DATA_MAX_Y, 1, (int) zEnd);
     }
 
     private record PendingBlock(BlockPos pos, DyeColor color) {}
