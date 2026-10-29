@@ -118,7 +118,8 @@ public class TcpCliServer {
 
     private void executeAndPrint(PrintWriter writer, String sql) {
         try {
-            SqlExecutor.QueryResult result = dbManager.getSqlExecutor().execute(sql);
+            // 经由 DatabaseManager 调度到服务端主线程执行（世界访问只允许主线程）
+            SqlExecutor.QueryResult result = dbManager.executeSql(sql);
 
             if (result.isSuccess()) {
                 writer.println(result.getMessage());

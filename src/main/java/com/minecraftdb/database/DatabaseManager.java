@@ -10,6 +10,10 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.block.Blocks;
 
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Supplier;
 
 /**
  * 顶层数据库管理器。
@@ -130,6 +134,37 @@ public class DatabaseManager {
     }
 
     // === Getters ===
+
+    /**
+     * 在服务端主线程执行 SQL。HTTP/TCP 线程必须经由本方法访问数据库：
+     * Minecraft 的 Level/setBlock 只允许主线程访问，跨线程读写 chunk
+     * 会导致并发修改异常、崩溃或存档损坏。
+     */
+    public SqlExecutor.QueryResult executeSql(String sql) {
+        return callOnServerThread(() -> sqlExecutor.execute(sql));
+    }
+
+    /**
+     * 在服务端主线程执行任务并同步等待结果。已在主线程则直接执行。
+     */
+    public <T> T callOnServerThread(Supplier<T> task) {
+        if (server.isSameThread()) {
+            return task.get();
+        }
+        try {
+            return server.submit(task::get).get(30, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("数据库执行被中断", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            if (cause instanceof RuntimeException re) throw re;
+            if (cause instanceof Error error) throw error;
+            throw new RuntimeException(cause);
+        } catch (TimeoutException e) {
+            throw new RuntimeException("数据库任务在主线程排队超时（服务器可能正在关闭或卡顿）");
+        }
+    }
 
     public String getDatabaseName() {
         return databaseName;

@@ -45,7 +45,12 @@ public class HttpApiServer {
         server.createContext("/api/v1/table/", new TableHandler());
         server.createContext("/api/v1/health", new HealthHandler());
 
-        server.setExecutor(Executors.newFixedThreadPool(4));
+        // 守护线程池：服务器关闭时不会阻塞 JVM 退出
+        server.setExecutor(Executors.newFixedThreadPool(4, r -> {
+            Thread t = new Thread(r, "MinecraftDB-HTTP");
+            t.setDaemon(true);
+            return t;
+        }));
         server.start();
     }
 
@@ -117,7 +122,7 @@ public class HttpApiServer {
 
             try {
                 String decoded = URLDecoder.decode(sql, StandardCharsets.UTF_8);
-                SqlExecutor.QueryResult result = dbManager.getSqlExecutor().execute(decoded);
+                SqlExecutor.QueryResult result = dbManager.executeSql(decoded);
                 sendJson(exchange, 200, resultToMap(result));
             } catch (Exception e) {
                 sendJson(exchange, 400, Map.of("error", "Query failed", "message", e.getMessage()));
@@ -153,7 +158,7 @@ public class HttpApiServer {
             }
 
             try {
-                SqlExecutor.QueryResult result = dbManager.getSqlExecutor().execute(sql);
+                SqlExecutor.QueryResult result = dbManager.executeSql(sql);
                 sendJson(exchange, 200, resultToMap(result));
             } catch (Exception e) {
                 sendJson(exchange, 400, Map.of("error", "Execute failed", "message", e.getMessage()));
@@ -222,8 +227,8 @@ public class HttpApiServer {
                 sendJson(exchange, 404, Map.of("error", "Table not found: " + tableName));
                 return;
             }
-            List<com.minecraftdb.database.TableManager.RowWithZ> allRows =
-                    dbManager.getTableManager().readAllRows(tableName, schema);
+            List<com.minecraftdb.database.TableManager.RowWithZ> allRows = dbManager.callOnServerThread(
+                    () -> dbManager.getTableManager().readAllRows(tableName, schema));
             int total = allRows.size();
             int end = Math.min(offset + limit, total);
             List<Map<String, Object>> page = new ArrayList<>();
