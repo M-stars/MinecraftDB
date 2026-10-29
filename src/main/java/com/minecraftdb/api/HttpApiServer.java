@@ -60,10 +60,6 @@ public class HttpApiServer {
         }
     }
 
-    public int getPort() {
-        return port;
-    }
-
     // === 基础处理器 ===
 
     private abstract class BaseHandler implements HttpHandler {

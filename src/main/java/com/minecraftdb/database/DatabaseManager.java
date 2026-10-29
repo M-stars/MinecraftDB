@@ -171,14 +171,6 @@ public class DatabaseManager {
         return databaseName;
     }
 
-    public ServerLevel getDatabaseLevel() {
-        return databaseLevel;
-    }
-
-    public CoordinateAllocator getCoordAllocator() {
-        return coordAllocator;
-    }
-
     public TableManager getTableManager() {
         return tableManager;
     }

@@ -259,8 +259,4 @@ public class TcpCliServer {
         if (s.length() >= n) return s.substring(0, n);
         return s + " ".repeat(n - s.length());
     }
-
-    public int getPort() {
-        return port;
-    }
 }

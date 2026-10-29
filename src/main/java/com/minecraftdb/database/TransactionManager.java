@@ -140,10 +140,6 @@ public class TransactionManager {
         return currentTxn.get() != null;
     }
 
-    public Transaction getCurrentTransaction() {
-        return currentTxn.get();
-    }
-
     // === 方块变更日志 ===
 
     /**

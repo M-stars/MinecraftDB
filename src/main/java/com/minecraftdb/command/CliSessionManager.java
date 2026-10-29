@@ -26,12 +26,4 @@ public class CliSessionManager {
     public static boolean isInCli(ServerPlayer player) {
         return cliSessions.contains(player.getUUID());
     }
-
-    public static void exitAll() {
-        cliSessions.clear();
-    }
-
-    public static int activeCount() {
-        return cliSessions.size();
-    }
 }

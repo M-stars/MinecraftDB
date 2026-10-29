@@ -13,25 +13,6 @@ public final class WoolDecoder {
 
     private WoolDecoder() {}
 
-    public static Object decode(List<DyeColor> colors, String targetType) {
-        if (colors == null || colors.isEmpty()) return null;
-
-        DyeColor first = colors.get(0);
-
-        if (first == ColorCode.NULL_VAL) return null;
-
-        return switch (targetType.toUpperCase()) {
-            case "INT", "INTEGER" -> decodeInt(colors);
-            case "BIGINT" -> decodeBigInt(colors);
-            case "BOOLEAN", "BOOL" -> decodeBoolean(first);
-            case "FLOAT" -> decodeFloat(colors);
-            case "DOUBLE" -> decodeDouble(colors);
-            case "VARCHAR", "TEXT", "STRING" -> decodeString(colors);
-            case "DATE", "DATETIME" -> decodeTimestamp(colors);
-            default -> decodeString(colors);
-        };
-    }
-
     public static Integer decodeInt(List<DyeColor> colors) {
         if (colors == null || colors.isEmpty()) return null;
         if (colors.get(0) == ColorCode.NULL_VAL) return null;

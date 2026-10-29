@@ -6,8 +6,6 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.DyeColor;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
@@ -26,10 +24,6 @@ public class BlockOperator {
         this.level = level;
         this.txnManager = txnManager;
         this.batchMode = batchMode;
-    }
-
-    public ServerLevel getLevel() {
-        return level;
     }
 
     // === Write operations ===
@@ -61,24 +55,6 @@ public class BlockOperator {
         clearBlock(new BlockPos(x, y, z));
     }
 
-    public void writeRow(int xStart, int yBase, int z, List<DyeColor>[] columns) {
-        for (int col = 0; col < columns.length; col++) {
-            List<DyeColor> colorSeq = columns[col];
-            if (colorSeq == null) continue;
-            int x = xStart + col;
-            for (int dy = 0; dy < colorSeq.size(); dy++) {
-                DyeColor color = colorSeq.get(dy);
-                if (color != null) {
-                    writeWool(x, yBase + dy, z, color);
-                }
-            }
-        }
-    }
-
-    public void fillRow(int xStart, int xEnd, int y, int z, DyeColor color) {
-        WorldUtils.fillWool(level, xStart, xEnd, y, z, z, color);
-    }
-
     /**
      * Flush all pending batched block updates to the world.
      */
@@ -99,10 +75,6 @@ public class BlockOperator {
      */
     public void clearPending() {
         pendingQueue.clear();
-    }
-
-    public int pendingCount() {
-        return pendingQueue.size();
     }
 
     /**
@@ -132,41 +104,6 @@ public class BlockOperator {
 
     public DyeColor readWool(BlockPos pos) {
         return WorldUtils.getWoolColor(level, pos);
-    }
-
-    public List<DyeColor> readColumn(int x, int yStart, int yEnd, int z) {
-        List<DyeColor> colors = new ArrayList<>();
-        for (int y = yStart; y <= yEnd; y++) {
-            DyeColor color = readWool(x, y, z);
-            if (color == null) break;
-            colors.add(color);
-        }
-        return colors;
-    }
-
-    public List<DyeColor>[] readRow(int xStart, int columnCount, int yBase, int z) {
-        @SuppressWarnings("unchecked")
-        List<DyeColor>[] columns = new List[columnCount];
-        for (int col = 0; col < columnCount; col++) {
-            List<DyeColor> colors = new ArrayList<>();
-            for (int y = yBase; y < 256; y++) {
-                DyeColor color = readWool(xStart + col, y, z);
-                if (color == null) break;
-                colors.add(color);
-            }
-            columns[col] = colors;
-        }
-        return columns;
-    }
-
-    // === Bulk operations ===
-
-    public void clearArea(int xStart, int xEnd, int yStart, int yEnd, int zStart, int zEnd) {
-        WorldUtils.fillAreaAir(level, xStart, xEnd, yStart, yEnd, zStart, zEnd);
-    }
-
-    public void initializeTableArea(int xStart, int xEnd, int zEnd) {
-        WorldUtils.fillAreaAir(level, xStart, xEnd, WorldUtils.DATA_START_Y, WorldUtils.DATA_MAX_Y, 1, (int) zEnd);
     }
 
     private record PendingBlock(BlockPos pos, DyeColor color) {}

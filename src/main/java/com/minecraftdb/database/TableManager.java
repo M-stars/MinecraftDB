@@ -99,29 +99,6 @@ public class TableManager {
     }
 
     /**
-     * 一行数据及其在世界上真实的 Z 坐标。
-     * 已删除的行（空行）不进入结果，列表下标 ≠ z 坐标，写回时必须用这里的 z。
-     */
-    public record RowWithZ(long z, Map<String, Object> values) {}
-
-    public List<RowWithZ> readAllRows(String tableName, List<ColumnDefinition> schema) {
-        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
-        if (coords == null) return Collections.emptyList();
-
-        List<RowWithZ> rows = new ArrayList<>();
-        long maxZ = coords.nextZ;
-
-        for (int z = 1; z < maxZ; z++) {
-            Map<String, Object> row = readRow(tableName, schema, z);
-            if (row != null && !row.isEmpty()) {
-                rows.add(new RowWithZ(z, row));
-            }
-        }
-
-        return rows;
-    }
-
-    /**
      * 行扫描上界（已分配的下一个 z）。行号从 1 起，遍历 z=1..maxZ-1。
      */
     public long getMaxZ(String tableName) {

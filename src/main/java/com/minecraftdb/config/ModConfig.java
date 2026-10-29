@@ -28,14 +28,11 @@ public class ModConfig {
 
     // Database
     public static String DATABASE_DEFAULT_WORLD = "minecraftdb";
-    public static boolean DATABASE_AUTO_CREATE_WORLD = true;
     public static boolean DATABASE_WAL_ENABLED = true;
-    public static int DATABASE_CACHE_SIZE = 1000;
 
     // Performance
     public static int PERFORMANCE_MAX_SELECT_ROWS = 10000;
     public static boolean PERFORMANCE_BATCH_BLOCK_UPDATES = true;
-    public static boolean PERFORMANCE_ASYNC_QUERIES = true;
 
     public static void loadConfig(Path path) {
         if (!Files.exists(path)) {
@@ -63,14 +60,11 @@ public class ModConfig {
             }
             if (data.database != null) {
                 DATABASE_DEFAULT_WORLD = data.database.default_world;
-                DATABASE_AUTO_CREATE_WORLD = data.database.auto_create_world;
                 DATABASE_WAL_ENABLED = data.database.wal_enabled;
-                DATABASE_CACHE_SIZE = data.database.cache_size;
             }
             if (data.performance != null) {
                 PERFORMANCE_MAX_SELECT_ROWS = data.performance.max_select_rows;
                 PERFORMANCE_BATCH_BLOCK_UPDATES = data.performance.batch_block_updates;
-                PERFORMANCE_ASYNC_QUERIES = data.performance.async_queries;
             }
         } catch (IOException e) {
             saveConfig(path);
@@ -94,14 +88,11 @@ public class ModConfig {
 
         data.database = new DatabaseConfig();
         data.database.default_world = DATABASE_DEFAULT_WORLD;
-        data.database.auto_create_world = DATABASE_AUTO_CREATE_WORLD;
         data.database.wal_enabled = DATABASE_WAL_ENABLED;
-        data.database.cache_size = DATABASE_CACHE_SIZE;
 
         data.performance = new PerformanceConfig();
         data.performance.max_select_rows = PERFORMANCE_MAX_SELECT_ROWS;
         data.performance.batch_block_updates = PERFORMANCE_BATCH_BLOCK_UPDATES;
-        data.performance.async_queries = PERFORMANCE_ASYNC_QUERIES;
 
         try {
             Files.createDirectories(path.getParent());
@@ -136,14 +127,11 @@ public class ModConfig {
 
     private static class DatabaseConfig {
         String default_world;
-        boolean auto_create_world;
         boolean wal_enabled;
-        int cache_size;
     }
 
     private static class PerformanceConfig {
         int max_select_rows;
         boolean batch_block_updates;
-        boolean async_queries;
     }
 }

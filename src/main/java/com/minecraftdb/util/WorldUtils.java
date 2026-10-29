@@ -2,12 +2,10 @@ package com.minecraftdb.util;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.item.DyeColor;
-import net.minecraft.resources.ResourceKey;
 
 import java.util.Map;
 
@@ -19,8 +17,6 @@ public final class WorldUtils {
     public static final int BEDROCK_Y = 0;
     public static final int DATA_START_Y = 1;
     public static final int DATA_MAX_Y = 255;
-    public static final int WAL_START_Y = -64;
-    public static final int WAL_END_Y = -60;
 
     // 16色羊毛 Block -> DyeColor 映射
     private static final Map<Block, DyeColor> WOOL_COLOR_MAP = Map.ofEntries(
@@ -84,28 +80,6 @@ public final class WorldUtils {
         level.removeBlock(pos, false);
     }
 
-    public static void fillWool(ServerLevel level, int xStart, int xEnd, int y, int zStart, int zEnd, DyeColor color) {
-        BlockState state = woolState(color);
-        for (int x = xStart; x <= xEnd; x++) {
-            for (int z = zStart; z <= zEnd; z++) {
-                level.setBlock(new BlockPos(x, y, z), state, 3);
-            }
-        }
-    }
-
-    public static void fillAreaWool(ServerLevel level, int xStart, int xEnd, int yStart, int yEnd, int zStart, int zEnd, DyeColor color) {
-        BlockState state = woolState(color);
-        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
-        for (int x = xStart; x <= xEnd; x++) {
-            for (int y = yStart; y <= yEnd; y++) {
-                for (int z = zStart; z <= zEnd; z++) {
-                    pos.set(x, y, z);
-                    level.setBlock(pos, state, 3);
-                }
-            }
-        }
-    }
-
     public static void fillAreaAir(ServerLevel level, int xStart, int xEnd, int yStart, int yEnd, int zStart, int zEnd) {
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
         for (int x = xStart; x <= xEnd; x++) {
@@ -116,10 +90,5 @@ public final class WorldUtils {
                 }
             }
         }
-    }
-
-    public static boolean isDatabaseWorld(ServerLevel level) {
-        ResourceKey<Level> key = level.dimension();
-        return key.location().getPath().contains("minecraftdb");
     }
 }
