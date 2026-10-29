@@ -499,7 +499,8 @@ public class SqlExecutor {
 
     private QueryResult executeCreateIndex(CreateIndexStatement stmt) {
         dbManager.getSchemaManager().addIndex(stmt.tableName, stmt.indexName, stmt.columnName);
-        return QueryResult.ok("Index '" + stmt.indexName + "' created on '" + stmt.tableName + "(" + stmt.columnName + ")'");
+        return QueryResult.ok("Index '" + stmt.indexName + "' created on '"
+                + stmt.tableName + "(" + stmt.columnName + ")'（当前索引为元数据，不参与查询计划）");
     }
 
     private QueryResult executeShowIndexes(ShowIndexesStatement stmt) {

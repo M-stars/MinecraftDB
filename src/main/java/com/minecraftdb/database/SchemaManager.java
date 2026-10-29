@@ -5,6 +5,8 @@ import com.google.gson.reflect.TypeToken;
 import com.minecraftdb.sql.ast.ColumnDefinition;
 import com.minecraftdb.storage.CoordinateAllocator;
 import net.minecraft.server.level.ServerLevel;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -18,8 +20,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * 所有元数据存储在 config/minecraftdb/schemas/<世界名>/ 目录下：
  *   - {表名}.json 存储Schema定义
  *   - _tables.json 存储表名到坐标的映射注册表
+ *   - _indexes.json 存储索引元数据（当前索引仅作为元数据，不参与查询计划）
  */
 public class SchemaManager {
+
+    private static final Logger LOGGER = LogManager.getLogger("MinecraftDB");
+    private static final String INDEX_FILE = "_indexes.json";
 
     private final ServerLevel level;
     private final CoordinateAllocator coordAllocator;
@@ -78,7 +84,9 @@ public class SchemaManager {
 
     public void removeSchema(String tableName) {
         schemaCache.remove(tableName);
-        indexCache.remove(tableName);
+        if (indexCache.remove(tableName) != null) {
+            saveIndexes();
+        }
         try {
             Files.deleteIfExists(schemaDir.resolve(tableName + ".json"));
         } catch (IOException ignored) {}
@@ -125,15 +133,41 @@ public class SchemaManager {
     public void addIndex(String tableName, String indexName, String columnName) {
         Map<String, String> indexes = indexCache.computeIfAbsent(tableName, k -> new LinkedHashMap<>());
         indexes.put(indexName, columnName);
+        saveIndexes();
     }
 
     public Map<String, String> getIndexes(String tableName) {
         return indexCache.getOrDefault(tableName, Collections.emptyMap());
     }
 
+    /** 索引元数据持久化到 _indexes.json（不参与查询计划，仅供 SHOW INDEXES 与未来优化器使用） */
+    private void saveIndexes() {
+        try {
+            Files.writeString(schemaDir.resolve(INDEX_FILE), gson.toJson(indexCache));
+        } catch (IOException e) {
+            LOGGER.error("保存索引元数据失败: {}", e.toString());
+        }
+    }
+
+    private void loadIndexes() {
+        Path file = schemaDir.resolve(INDEX_FILE);
+        if (!Files.exists(file)) return;
+        try {
+            String json = Files.readString(file);
+            Map<String, Map<String, String>> data = gson.fromJson(json,
+                    new TypeToken<Map<String, Map<String, String>>>() {}.getType());
+            if (data != null) {
+                indexCache.putAll(data);
+            }
+        } catch (IOException e) {
+            LOGGER.error("加载索引元数据失败: {}", e.toString());
+        }
+    }
+
     // === 启动时加载 ===
 
     public void loadAllSchemas() {
+        loadIndexes();
         try {
             if (Files.exists(schemaDir)) {
                 try (var files = Files.list(schemaDir)) {
