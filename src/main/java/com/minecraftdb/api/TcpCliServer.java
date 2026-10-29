@@ -1,33 +1,39 @@
 package com.minecraftdb.api;
 
+import com.minecraftdb.config.ModConfig;
 import com.minecraftdb.database.DatabaseManager;
 import com.minecraftdb.sql.SqlExecutor;
 
 import java.io.*;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.List;
 
 /**
  * TCP CLI 服务器 — 通过 telnet 连接直接输入 SQL。
- * 默认端口 25567，连接后即可像 MySQL 终端一样交互操作。
+ * 默认仅绑定 127.0.0.1；配置 TCP_CLI_TOKEN 后连接需先输入 auth <token> 才能执行 SQL。
  */
 public class TcpCliServer {
 
+    private final String bindAddress;
     private final int port;
     private final DatabaseManager dbManager;
     private ServerSocket serverSocket;
     private Thread listenerThread;
     private volatile boolean running;
 
-    public TcpCliServer(int port, DatabaseManager dbManager) {
+    public TcpCliServer(String bindAddress, int port, DatabaseManager dbManager) {
+        this.bindAddress = bindAddress;
         this.port = port;
         this.dbManager = dbManager;
     }
 
     public void start() throws IOException {
-        serverSocket = new ServerSocket(port);
+        serverSocket = new ServerSocket();
+        serverSocket.bind(new InetSocketAddress(bindAddress, port));
         running = true;
 
         listenerThread = new Thread(() -> {
@@ -77,6 +83,10 @@ public class TcpCliServer {
             writer.println("╚══════════════════════════════════════════╝");
             writer.println("");
 
+            if (!authenticate(reader, writer)) {
+                return;
+            }
+
             while (running) {
                 writer.print("db > ");
                 writer.flush();
@@ -114,6 +124,36 @@ public class TcpCliServer {
         } finally {
             try { client.close(); } catch (IOException ignored) {}
         }
+    }
+
+    /**
+     * 配置了 token 时，连接后必须先输入 auth <token>，最多尝试 3 次。
+     */
+    private boolean authenticate(BufferedReader reader, PrintWriter writer) throws IOException {
+        String token = ModConfig.TCP_CLI_TOKEN;
+        if (token == null || token.isEmpty()) return true;
+
+        writer.println("此终端已启用认证，请输入: auth <token>");
+        for (int attempt = 0; attempt < 3; attempt++) {
+            writer.print("auth > ");
+            writer.flush();
+            String line = reader.readLine();
+            if (line == null) return false;
+
+            String trimmed = line.trim();
+            if (trimmed.toLowerCase().startsWith("auth ")) {
+                String candidate = trimmed.substring(5).trim();
+                if (MessageDigest.isEqual(
+                        candidate.getBytes(StandardCharsets.UTF_8),
+                        token.getBytes(StandardCharsets.UTF_8))) {
+                    writer.println("认证成功，欢迎！");
+                    return true;
+                }
+            }
+            writer.println("认证失败（剩余尝试次数: " + (2 - attempt) + "）");
+        }
+        writer.println("尝试次数过多，连接关闭。");
+        return false;
     }
 
     private void executeAndPrint(PrintWriter writer, String sql) {

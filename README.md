@@ -69,6 +69,8 @@ telnet localhost 25567
 | `HTTP_API_TOKEN` | 空 | Bearer Token 认证 |
 | `TCP_CLI_ENABLED` | `true` | 启用 TCP CLI |
 | `TCP_CLI_PORT` | `25567` | TCP CLI 端口 |
+| `TCP_CLI_BIND_ADDRESS` | `127.0.0.1` | TCP CLI 绑定地址，对外网开放前务必设置 Token |
+| `TCP_CLI_TOKEN` | 空 | TCP CLI 认证 Token，设置后连接需先输入 `auth <token>` |
 | `DATABASE_DEFAULT_WORLD` | `minecraftdb` | 作为数据库的世界名称 |
 | `DATABASE_AUTO_CREATE_WORLD` | `true` | 自动创建数据库世界 |
 | `DATABASE_WAL_ENABLED` | `true` | 启用 WAL |

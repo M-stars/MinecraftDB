@@ -23,6 +23,8 @@ public class ModConfig {
     // TCP CLI (Telnet 式 SQL 终端)
     public static boolean TCP_CLI_ENABLED = true;
     public static int TCP_CLI_PORT = 25567;
+    public static String TCP_CLI_BIND_ADDRESS = "127.0.0.1";
+    public static String TCP_CLI_TOKEN = "";
 
     // Database
     public static String DATABASE_DEFAULT_WORLD = "minecraftdb";
@@ -56,6 +58,8 @@ public class ModConfig {
             if (data.tcp_cli != null) {
                 TCP_CLI_ENABLED = data.tcp_cli.enabled;
                 TCP_CLI_PORT = data.tcp_cli.port;
+                TCP_CLI_BIND_ADDRESS = data.tcp_cli.bind_address != null ? data.tcp_cli.bind_address : "127.0.0.1";
+                TCP_CLI_TOKEN = data.tcp_cli.token != null ? data.tcp_cli.token : "";
             }
             if (data.database != null) {
                 DATABASE_DEFAULT_WORLD = data.database.default_world;
@@ -85,6 +89,8 @@ public class ModConfig {
         data.tcp_cli = new TcpCliConfig();
         data.tcp_cli.enabled = TCP_CLI_ENABLED;
         data.tcp_cli.port = TCP_CLI_PORT;
+        data.tcp_cli.bind_address = TCP_CLI_BIND_ADDRESS;
+        data.tcp_cli.token = TCP_CLI_TOKEN;
 
         data.database = new DatabaseConfig();
         data.database.default_world = DATABASE_DEFAULT_WORLD;
@@ -124,6 +130,8 @@ public class ModConfig {
     private static class TcpCliConfig {
         boolean enabled;
         int port;
+        String bind_address;
+        String token;
     }
 
     private static class DatabaseConfig {

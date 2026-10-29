@@ -70,11 +70,14 @@ public class MinecraftDB {
         }
 
         if (ModConfig.TCP_CLI_ENABLED) {
-            tcpCliServer = new TcpCliServer(ModConfig.TCP_CLI_PORT, databaseManager);
+            tcpCliServer = new TcpCliServer(ModConfig.TCP_CLI_BIND_ADDRESS, ModConfig.TCP_CLI_PORT, databaseManager);
             try {
                 tcpCliServer.start();
-                LOGGER.info("TCP CLI server started on port {} (telnet localhost {})",
-                        ModConfig.TCP_CLI_PORT, ModConfig.TCP_CLI_PORT);
+                LOGGER.info("TCP CLI server started on {}:{} (telnet {} {})",
+                        ModConfig.TCP_CLI_BIND_ADDRESS,
+                        ModConfig.TCP_CLI_PORT,
+                        ModConfig.TCP_CLI_BIND_ADDRESS,
+                        ModConfig.TCP_CLI_PORT);
             } catch (Exception e) {
                 LOGGER.error("Failed to start TCP CLI server", e);
             }
