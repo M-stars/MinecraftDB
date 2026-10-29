@@ -42,10 +42,10 @@ class SqlParserTest {
         SelectStatement stmt = (SelectStatement) parse("SELECT * FROM users WHERE age > 18");
         assertEquals("users", stmt.tableName);
         assertNotNull(stmt.whereClause);
-        assertEquals(1, stmt.whereClause.conditions.size());
-        assertEquals("age", stmt.whereClause.conditions.get(0).column);
-        assertEquals(">", stmt.whereClause.conditions.get(0).operator);
-        assertEquals("18", stmt.whereClause.conditions.get(0).value);
+        // 解析后可求值：行为断言
+        List<String> cols = List.of("age");
+        assertTrue(stmt.whereClause.evaluate(cols, List.of(25)));
+        assertFalse(stmt.whereClause.evaluate(cols, List.of(18)));
     }
 
     @Test
@@ -54,9 +54,10 @@ class SqlParserTest {
         SelectStatement stmt = (SelectStatement) parse(
             "SELECT * FROM users WHERE age > 18 AND name = 'Bob'");
         assertNotNull(stmt.whereClause);
-        assertEquals(2, stmt.whereClause.conditions.size());
-        assertEquals(1, stmt.whereClause.logicalOps.size());
-        assertEquals(WhereClause.LogicalOp.AND, stmt.whereClause.logicalOps.get(0));
+        List<String> cols = List.of("age", "name");
+        assertTrue(stmt.whereClause.evaluate(cols, List.of(25, "Bob")));
+        assertFalse(stmt.whereClause.evaluate(cols, List.of(25, "Alice")));
+        assertFalse(stmt.whereClause.evaluate(cols, List.of(17, "Bob")));
     }
 
     @Test

@@ -3,7 +3,6 @@ package com.minecraftdb.sql;
 import com.minecraftdb.sql.SqlLexer.Token;
 import com.minecraftdb.sql.SqlLexer.TokenType;
 import com.minecraftdb.sql.ast.*;
-import com.minecraftdb.sql.ast.WhereClause.LogicalOp;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -352,24 +351,87 @@ public class SqlParser {
 
     private WhereClause parseWhereClause() {
         expect(TokenType.WHERE);
-        WhereClause wc = new WhereClause();
-
-        wc.addCondition(parseCondition());
-        while (peek().type() == TokenType.AND || peek().type() == TokenType.OR) {
-            LogicalOp op = peek().type() == TokenType.AND ? LogicalOp.AND : LogicalOp.OR;
-            advance();
-            wc.addLogicalOp(op);
-            wc.addCondition(parseCondition());
-        }
-
-        return wc;
+        return new WhereClause(parseOrExpression());
     }
 
-    private WhereClause.Condition parseCondition() {
+    /** OR 优先级最低：a OR b AND c == a OR (b AND c) */
+    private WhereClause.Node parseOrExpression() {
+        WhereClause.Node left = parseAndExpression();
+        while (peek().type() == TokenType.OR) {
+            advance();
+            left = new WhereClause.OrNode(left, parseAndExpression());
+        }
+        return left;
+    }
+
+    private WhereClause.Node parseAndExpression() {
+        WhereClause.Node left = parseNotExpression();
+        while (peek().type() == TokenType.AND) {
+            advance();
+            left = new WhereClause.AndNode(left, parseNotExpression());
+        }
+        return left;
+    }
+
+    private WhereClause.Node parseNotExpression() {
+        if (peek().type() == TokenType.NOT) {
+            advance();
+            return new WhereClause.NotNode(parseNotExpression());
+        }
+        return parsePrimaryExpression();
+    }
+
+    private WhereClause.Node parsePrimaryExpression() {
+        if (peek().type() == TokenType.LPAREN) {
+            advance();
+            WhereClause.Node inner = parseOrExpression();
+            expect(TokenType.RPAREN);
+            return inner;
+        }
+        return parseCondition();
+    }
+
+    private WhereClause.Node parseCondition() {
         String column = parseIdentifier();
-        String operator = parseComparisonOp();
-        String value = parseValue();
-        return new WhereClause.Condition(column, operator, value);
+
+        if (peek().type() == TokenType.IS) {
+            advance();
+            boolean negated = false;
+            if (peek().type() == TokenType.NOT) {
+                negated = true;
+                advance();
+            }
+            expect(TokenType.NULL_KW);
+            return new WhereClause.NullCondition(column, negated);
+        }
+
+        if (peek().type() == TokenType.LIKE) {
+            advance();
+            return new WhereClause.LikeCondition(column, parseValue());
+        }
+
+        boolean negatedIn = false;
+        if (peek().type() == TokenType.NOT) {
+            advance();
+            expect(TokenType.IN);
+            negatedIn = true;
+        } else if (peek().type() == TokenType.IN) {
+            advance();
+        } else {
+            String operator = parseComparisonOp();
+            String value = parseValue();
+            return new WhereClause.OpCondition(column, operator, value);
+        }
+
+        expect(TokenType.LPAREN);
+        List<String> values = new ArrayList<>();
+        values.add(parseValue());
+        while (peek().type() == TokenType.COMMA) {
+            advance();
+            values.add(parseValue());
+        }
+        expect(TokenType.RPAREN);
+        return new WhereClause.InCondition(column, values, negatedIn);
     }
 
     // === Helpers ===

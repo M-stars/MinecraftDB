@@ -180,6 +180,7 @@ public class SqlLexer {
         BEGIN, COMMIT, ROLLBACK,
         SHOW, TABLES, DESC, INDEX, INDEXES, ON,
         ORDER, BY, LIMIT, OFFSET, ASC,
+        IN, IS, LIKE,
         VARCHAR, INT, BIGINT, TEXT, BOOLEAN, FLOAT, DOUBLE, DATE, DATETIME,
 
         // Identifiers and literals
@@ -240,6 +241,9 @@ public class SqlLexer {
             MAP.put("limit", TokenType.LIMIT);
             MAP.put("offset", TokenType.OFFSET);
             MAP.put("asc", TokenType.ASC);
+            MAP.put("in", TokenType.IN);
+            MAP.put("is", TokenType.IS);
+            MAP.put("like", TokenType.LIKE);
             MAP.put("desc", TokenType.DESC);
             MAP.put("varchar", TokenType.VARCHAR);
             MAP.put("int", TokenType.INT);

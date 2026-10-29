@@ -67,8 +67,12 @@ class SqlIntegrationTest {
         SelectStatement stmt = parse(
             "SELECT * FROM products WHERE price > 100 AND category = 'electronics' OR stock < 5");
         assertEquals("products", stmt.tableName);
-        assertEquals(3, stmt.whereClause.conditions.size());
-        assertEquals(2, stmt.whereClause.logicalOps.size());
+        assertNotNull(stmt.whereClause);
+        // 优先级验证：AND 先于 OR → (price>100 AND electronics) OR stock<5
+        List<String> cols = List.of("price", "category", "stock");
+        assertTrue(stmt.whereClause.evaluate(cols, List.of(200, "electronics", 10)));
+        assertTrue(stmt.whereClause.evaluate(cols, List.of(50, "toys", 3)));
+        assertFalse(stmt.whereClause.evaluate(cols, List.of(50, "toys", 10)));
     }
 
     @Test
@@ -102,20 +106,26 @@ class SqlIntegrationTest {
     @DisplayName("负数比较解析")
     void negativeNumberWhere() {
         SelectStatement stmt = parse("SELECT * FROM accounts WHERE balance < -100");
-        assertEquals("balance", stmt.whereClause.conditions.get(0).column);
-        assertEquals("<", stmt.whereClause.conditions.get(0).operator);
-        assertEquals("-100", stmt.whereClause.conditions.get(0).value);
+        assertNotNull(stmt.whereClause);
+        List<String> cols = List.of("balance");
+        assertTrue(stmt.whereClause.evaluate(cols, List.of(-150)));
+        assertFalse(stmt.whereClause.evaluate(cols, List.of(-50)));
     }
 
     @Test
     @DisplayName("所有比较运算符")
     void allComparisonOperators() {
-        String[] ops = {"=", "!=", "<>", ">", "<", ">=", "<="};
-        for (String op : ops) {
-            String sql = "SELECT * FROM t WHERE x " + op + " 5";
-            SelectStatement stmt = parse(sql);
-            assertEquals(op, stmt.whereClause.conditions.get(0).operator,
-                    "运算符解析失败: " + op);
+        List<String> cols = List.of("x");
+        for (String op : new String[]{"=", "!=", "<>", ">", "<", ">=", "<="}) {
+            SelectStatement stmt = parse("SELECT * FROM t WHERE x " + op + " 5");
+            assertNotNull(stmt.whereClause, "运算符解析失败: " + op);
+            // 用 x=5 验证各运算符语义
+            boolean expected = switch (op) {
+                case "=", ">=", "<=" -> true;
+                default -> false;
+            };
+            assertEquals(expected, stmt.whereClause.evaluate(cols, List.of(5)),
+                    "运算符语义错误: " + op);
         }
     }
 

@@ -1,122 +1,121 @@
 package com.minecraftdb.sql.ast;
 
-import org.junit.jupiter.api.Test;
+import com.minecraftdb.sql.SqlLexer;
+import com.minecraftdb.sql.SqlParser;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class WhereClauseTest {
 
-    @Test
-    @DisplayName("条件列名大小写不敏感")
-    void caseInsensitiveColumn() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("NAME", "=", "'Alice'"));
-        assertTrue(wc.evaluate(List.of("id", "name", "age"), List.of(1, "Alice", 25)));
-        assertFalse(wc.evaluate(List.of("id", "name", "age"), List.of(1, "Bob", 25)));
+    private WhereClause where(String condition) {
+        SqlLexer lexer = new SqlLexer("SELECT * FROM t WHERE " + condition);
+        return ((SelectStatement) new SqlParser(lexer.tokenize()).parse()).whereClause;
     }
 
+    private static final List<String> COLS = List.of("id", "name", "age");
+
     @Test
-    @DisplayName("等于条件匹配")
+    @DisplayName("等于条件")
     void equalsMatch() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("name", "=", "'Alice'"));
-        List<String> cols = List.of("id", "name", "age");
-        List<Object> row = List.of(1, "Alice", 25);
-        assertTrue(wc.evaluate(cols, row));
+        assertTrue(where("name = 'Alice'").evaluate(COLS, List.of(1, "Alice", 25)));
+        assertFalse(where("name = 'Bob'").evaluate(COLS, List.of(1, "Alice", 25)));
     }
 
     @Test
-    @DisplayName("等于条件不匹配")
-    void equalsNoMatch() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("name", "=", "'Bob'"));
-        List<String> cols = List.of("name");
-        List<Object> row = List.of("Alice");
-        assertFalse(wc.evaluate(cols, row));
+    @DisplayName("AND/OR 优先级：AND 先于 OR（a OR b AND c == a OR (b AND c)）")
+    void precedence() {
+        WhereClause wc = where("id = 1 OR name = 'x' AND age = 3");
+        // id=1 命中 → true，无论后件
+        assertTrue(wc.evaluate(COLS, List.of(1, "anything", 0)));
+        // id≠1，(name='x' AND age=3) 不成立 → false
+        assertFalse(wc.evaluate(COLS, List.of(2, "x", 0)));
+        assertTrue(wc.evaluate(COLS, List.of(2, "x", 3)));
     }
 
     @Test
-    @DisplayName("大于条件")
-    void greaterThan() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("age", ">", "18"));
-        List<String> cols = List.of("age");
-        assertTrue(wc.evaluate(cols, List.of(25)));
-        assertFalse(wc.evaluate(cols, List.of(15)));
-        assertFalse(wc.evaluate(cols, List.of(18)));
+    @DisplayName("括号改变优先级")
+    void parentheses() {
+        WhereClause wc = where("(id = 1 OR name = 'x') AND age = 3");
+        assertFalse(wc.evaluate(COLS, List.of(1, "anything", 0)));
+        assertFalse(wc.evaluate(COLS, List.of(2, "x", 0)));
+        assertTrue(wc.evaluate(COLS, List.of(1, "anything", 3)));
     }
 
     @Test
-    @DisplayName("小于条件")
-    void lessThan() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("age", "<", "60"));
-        List<String> cols = List.of("age");
-        assertTrue(wc.evaluate(cols, List.of(25)));
-        assertFalse(wc.evaluate(cols, List.of(80)));
+    @DisplayName("NOT 前缀")
+    void notPrefix() {
+        assertTrue(where("NOT id = 1").evaluate(COLS, List.of(2, "a", 3)));
+        assertFalse(where("NOT id = 1").evaluate(COLS, List.of(1, "a", 3)));
+        assertTrue(where("NOT (id = 1 AND age = 3)").evaluate(COLS, List.of(1, "a", 4)));
     }
 
     @Test
-    @DisplayName("不等于条件")
-    void notEquals() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("status", "!=", "'deleted'"));
-        List<String> cols = List.of("status");
-        assertTrue(wc.evaluate(cols, List.of("active")));
-        assertFalse(wc.evaluate(cols, List.of("deleted")));
+    @DisplayName("IS NULL / IS NOT NULL")
+    void isNull() {
+        assertTrue(where("name IS NULL").evaluate(COLS, Arrays.asList(1, null, 3)));
+        assertFalse(where("name IS NULL").evaluate(COLS, List.of(1, "a", 3)));
+        assertTrue(where("name IS NOT NULL").evaluate(COLS, List.of(1, "a", 3)));
+        assertFalse(where("name IS NOT NULL").evaluate(COLS, Arrays.asList(1, null, 3)));
     }
 
     @Test
-    @DisplayName("AND 组合条件")
-    void andCondition() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("age", ">", "18"));
-        wc.addLogicalOp(WhereClause.LogicalOp.AND);
-        wc.addCondition(new WhereClause.Condition("status", "=", "'active'"));
-        List<String> cols = List.of("age", "status");
-        assertTrue(wc.evaluate(cols, List.of(25, "active")));
-        assertFalse(wc.evaluate(cols, List.of(25, "inactive")));
-        assertFalse(wc.evaluate(cols, List.of(10, "active")));
+    @DisplayName("IN / NOT IN")
+    void inList() {
+        assertTrue(where("id IN (1, 2, 3)").evaluate(COLS, List.of(2, "a", 3)));
+        assertFalse(where("id IN (1, 2, 3)").evaluate(COLS, List.of(9, "a", 3)));
+        assertFalse(where("id NOT IN (1, 2, 3)").evaluate(COLS, List.of(2, "a", 3)));
+        assertTrue(where("id NOT IN (1, 2, 3)").evaluate(COLS, List.of(9, "a", 3)));
+        assertTrue(where("name IN ('Alice', 'Bob')").evaluate(COLS, List.of(1, "Alice", 3)));
     }
 
     @Test
-    @DisplayName("OR 组合条件")
-    void orCondition() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("age", ">", "60"));
-        wc.addLogicalOp(WhereClause.LogicalOp.OR);
-        wc.addCondition(new WhereClause.Condition("age", "<", "18"));
-        List<String> cols = List.of("age");
-        assertTrue(wc.evaluate(cols, List.of(70)));
-        assertTrue(wc.evaluate(cols, List.of(10)));
-        assertFalse(wc.evaluate(cols, List.of(30)));
+    @DisplayName("LIKE：通配符 % 与 _")
+    void like() {
+        assertTrue(where("name LIKE 'Ali%'").evaluate(COLS, List.of(1, "Alice", 3)));
+        assertFalse(where("name LIKE 'ali%'").evaluate(COLS, List.of(1, "Alice", 3)));
+        assertTrue(where("name LIKE '_ob'").evaluate(COLS, List.of(1, "Bob", 3)));
+        assertTrue(where("name LIKE '%li%'").evaluate(COLS, List.of(1, "Alice", 3)));
+        assertFalse(where("name LIKE 'ob'").evaluate(COLS, List.of(1, "Bob", 3)));
+        assertTrue(where("name LIKE 'Alice'").evaluate(COLS, List.of(1, "Alice", 3)));
     }
 
     @Test
-    @DisplayName("空 WHERE 子句始终为 true")
-    void emptyWhereAlwaysTrue() {
-        WhereClause wc = new WhereClause();
-        assertTrue(wc.evaluate(List.of("x"), List.of(1)));
+    @DisplayName("NULL 参与 IN/LIKE/比较恒为 false（unknown 语义）")
+    void nullSemantics() {
+        assertFalse(where("name IN ('Alice')").evaluate(COLS, Arrays.asList(1, null, 3)));
+        assertFalse(where("name NOT IN ('Alice')").evaluate(COLS, Arrays.asList(1, null, 3)));
+        assertFalse(where("name LIKE '%i%'").evaluate(COLS, Arrays.asList(1, null, 3)));
+        assertFalse(where("name = 'x'").evaluate(COLS, Arrays.asList(1, null, 3)));
+        assertFalse(where("age > 1").evaluate(COLS, Arrays.asList(1, "a", null)));
     }
 
     @Test
-    @DisplayName("NULL 值比较")
-    void nullValueComparison() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("col", "=", "null"));
-        List<String> cols = List.of("col");
-        // NULL 值在列表中会被表示为 null
-        assertFalse(wc.evaluate(cols, List.of("something")));
+    @DisplayName("引用不存在的列恒为 false")
+    void unknownColumn() {
+        assertFalse(where("ghost = 1").evaluate(COLS, List.of(1, "a", 3)));
+        assertFalse(where("ghost IS NULL").evaluate(COLS, List.of(1, "a", 3)));
     }
 
     @Test
-    @DisplayName("列名不存在时返回 false")
-    void missingColumn() {
-        WhereClause wc = new WhereClause();
-        wc.addCondition(new WhereClause.Condition("nonexistent", "=", "'x'"));
-        assertFalse(wc.evaluate(List.of("name"), List.of("Alice")));
+    @DisplayName("大小写不敏感的列名")
+    void caseInsensitiveColumn() {
+        assertTrue(where("NAME = 'Alice'").evaluate(COLS, List.of(1, "Alice", 3)));
+        assertTrue(where("Id = 1").evaluate(COLS, List.of(1, "Alice", 3)));
+    }
+
+    @Test
+    @DisplayName("复合条件组合")
+    void combined() {
+        WhereClause wc = where("age >= 18 AND (name LIKE 'A%' OR id IN (7, 9)) AND name IS NOT NULL");
+        assertTrue(wc.evaluate(COLS, List.of(1, "Alice", 25)));
+        assertFalse(wc.evaluate(COLS, List.of(1, "Alice", 17)));
+        assertTrue(wc.evaluate(COLS, List.of(9, "Bob", 20)));
+        assertFalse(wc.evaluate(COLS, List.of(9, "Bob", 17)));
+        assertFalse(wc.evaluate(COLS, Arrays.asList(3, null, 30)));
     }
 }
