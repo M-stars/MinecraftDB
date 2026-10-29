@@ -1,5 +1,6 @@
 package com.minecraftdb.sql;
 
+import com.minecraftdb.config.ModConfig;
 import com.minecraftdb.database.DatabaseManager;
 import com.minecraftdb.database.SchemaManager;
 import com.minecraftdb.database.TableManager;
@@ -190,27 +191,7 @@ public class SqlExecutor {
             columnNames.add(cd.name);
         }
 
-        List<TableManager.RowWithZ> allRows = tableManager.readAllRows(stmt.tableName, schema);
-
-        // Apply WHERE filter
-        List<Map<String, Object>> filteredRows = new ArrayList<>();
-        for (TableManager.RowWithZ rowWithZ : allRows) {
-            Map<String, Object> row = rowWithZ.values();
-            if (row == null || row.isEmpty()) continue;
-            if (stmt.whereClause == null) {
-                filteredRows.add(row);
-            } else {
-                List<Object> rowValues = new ArrayList<>();
-                for (String col : columnNames) {
-                    rowValues.add(row.get(col));
-                }
-                if (stmt.whereClause.evaluate(columnNames, rowValues)) {
-                    filteredRows.add(row);
-                }
-            }
-        }
-
-        // ORDER BY（列名统一为 schema 内的真实列名，找不到直接报错）
+        // ORDER BY 列名校验与归一（大小写不敏感）
         List<SelectStatement.OrderBy> resolvedOrderBy = new ArrayList<>();
         for (SelectStatement.OrderBy ob : stmt.orderBy) {
             ColumnDefinition cd = findColumn(schema, ob.column());
@@ -219,8 +200,51 @@ public class SqlExecutor {
             }
             resolvedOrderBy.add(new SelectStatement.OrderBy(cd.name, ob.ascending()));
         }
-        if (!resolvedOrderBy.isEmpty()) {
-            filteredRows.sort((a, b) -> {
+
+        // 读取上限：显式 LIMIT 优先，否则用配置的全局上限
+        int hardCap = stmt.limit != null
+                ? stmt.limit
+                : ModConfig.PERFORMANCE_MAX_SELECT_ROWS;
+        boolean needsSort = !resolvedOrderBy.isEmpty();
+
+        // 流式逐行扫描：WHERE 在读取阶段求值，避免全量物化
+        List<Map<String, Object>> collected = new ArrayList<>();
+        long maxZ = tableManager.getMaxZ(stmt.tableName);
+        int matchedCount = 0;
+        boolean capReached = false;
+        for (int z = 1; z < maxZ; z++) {
+            Map<String, Object> row = tableManager.readRow(stmt.tableName, schema, z);
+            if (row == null || row.isEmpty()) continue;
+
+            if (stmt.whereClause != null) {
+                List<Object> rowValues = new ArrayList<>();
+                for (String col : columnNames) {
+                    rowValues.add(row.get(col));
+                }
+                if (!stmt.whereClause.evaluate(columnNames, rowValues)) continue;
+            }
+            matchedCount++;
+
+            if (needsSort) {
+                // 需要排序：先收齐全部命中行（受 hardCap 保护），排序后再切片
+                if (collected.size() >= hardCap) {
+                    capReached = true;
+                    break;
+                }
+                collected.add(row);
+            } else {
+                // 无排序：跳过 offset 个命中行，收满即提前结束扫描
+                if (stmt.offset != null && matchedCount <= stmt.offset) continue;
+                if (collected.size() >= hardCap) {
+                    capReached = true;
+                    break;
+                }
+                collected.add(row);
+            }
+        }
+
+        if (needsSort) {
+            collected.sort((a, b) -> {
                 for (SelectStatement.OrderBy ob : resolvedOrderBy) {
                     int cmp = compareValues(a.get(ob.column()), b.get(ob.column()));
                     if (cmp != 0) return ob.ascending() ? cmp : -cmp;
@@ -229,15 +253,18 @@ public class SqlExecutor {
             });
         }
 
-        // LIMIT / OFFSET
-        int from = stmt.offset != null ? Math.min(stmt.offset, filteredRows.size()) : 0;
-        int to = stmt.limit != null ? Math.min(from + stmt.limit, filteredRows.size()) : filteredRows.size();
-        List<Map<String, Object>> pagedRows = filteredRows.subList(from, to);
+        int from = stmt.offset != null && needsSort ? Math.min(stmt.offset, collected.size()) : 0;
+        int to = stmt.limit != null && needsSort ? Math.min(from + stmt.limit, collected.size()) : collected.size();
+        List<Map<String, Object>> pagedRows = collected.subList(from, to);
 
         // Project columns
         List<String> selectColumns = stmt.isSelectAll() ? columnNames : stmt.columns;
 
-        QueryResult result = QueryResult.ok("Selected " + pagedRows.size() + " row(s)");
+        String message = "Selected " + pagedRows.size() + " row(s)";
+        if (capReached && stmt.limit == null) {
+            message += "（达到 PERFORMANCE_MAX_SELECT_ROWS 上限，结果已截断）";
+        }
+        QueryResult result = QueryResult.ok(message);
         result.setColumns(selectColumns);
 
         List<List<Object>> rows = new ArrayList<>();
@@ -284,15 +311,24 @@ public class SqlExecutor {
             columnNames.add(cd.name);
         }
 
-        List<TableManager.RowWithZ> allRows = tableManager.readAllRows(stmt.tableName, schema);
+        // SET 赋值只解析一次、只含被 SET 的列（此前每行重复解析且整行重写）
+        Map<String, Object> parsedAssignments = new LinkedHashMap<>();
+        for (Map.Entry<String, String> assign : stmt.assignments.entrySet()) {
+            ColumnDefinition colDef = findColumn(schema, assign.getKey());
+            if (colDef == null) {
+                return QueryResult.error("Unknown column '" + assign.getKey() + "' in SET clause");
+            }
+            parsedAssignments.put(colDef.name, parseValue(assign.getValue(), colDef.dataType));
+        }
 
-        int updated = 0;
         boolean autoCommit = !txnManager.isInTransaction();
         if (autoCommit) txnManager.begin();
 
+        int updated = 0;
         try {
-            for (TableManager.RowWithZ rowWithZ : allRows) {
-                Map<String, Object> row = rowWithZ.values();
+            long maxZ = tableManager.getMaxZ(stmt.tableName);
+            for (int z = 1; z < maxZ; z++) {
+                Map<String, Object> row = tableManager.readRow(stmt.tableName, schema, z);
                 if (row == null || row.isEmpty()) continue;
 
                 boolean matches = true;
@@ -305,17 +341,11 @@ public class SqlExecutor {
                 }
 
                 if (matches) {
-                    for (Map.Entry<String, String> assign : stmt.assignments.entrySet()) {
-                        ColumnDefinition colDef = findColumn(schema, assign.getKey());
-                        if (colDef != null) {
-                            Object parsedValue = parseValue(assign.getValue(), colDef.dataType);
-                            row.put(assign.getKey(), parsedValue);
-                        }
-                    }
-                    tableManager.updateRow(stmt.tableName, schema, rowWithZ.z(), row);
+                    tableManager.updateRow(stmt.tableName, schema, z, parsedAssignments);
                     updated++;
                 }
             }
+            tableManager.getBlockOperator().flush();
 
             if (autoCommit) txnManager.commit();
         } catch (Exception e) {
@@ -346,35 +376,33 @@ public class SqlExecutor {
             columnNames.add(cd.name);
         }
 
-        // For deletion, we mark rows as deleted (set to air)
-        List<TableManager.RowWithZ> allRows = tableManager.readAllRows(stmt.tableName, schema);
-        List<Long> toDelete = new ArrayList<>();
-
-        for (TableManager.RowWithZ rowWithZ : allRows) {
-            Map<String, Object> row = rowWithZ.values();
-            if (row == null || row.isEmpty()) continue;
-
-            boolean matches = true;
-            if (stmt.whereClause != null) {
-                List<Object> rowValues = new ArrayList<>();
-                for (String col : columnNames) {
-                    rowValues.add(row.get(col));
-                }
-                matches = stmt.whereClause.evaluate(columnNames, rowValues);
-            }
-
-            if (matches) {
-                toDelete.add(rowWithZ.z());
-            }
-        }
-
         boolean autoCommit = !txnManager.isInTransaction();
         if (autoCommit) txnManager.begin();
 
+        int deleted = 0;
         try {
-            for (long z : toDelete) {
-                tableManager.deleteRow(stmt.tableName, schema, z);
+            // 流式逐行判断并删除，全部完成后合并为一次批量 flush
+            long maxZ = tableManager.getMaxZ(stmt.tableName);
+            for (int z = 1; z < maxZ; z++) {
+                Map<String, Object> row = tableManager.readRow(stmt.tableName, schema, z);
+                if (row == null || row.isEmpty()) continue;
+
+                boolean matches = true;
+                if (stmt.whereClause != null) {
+                    List<Object> rowValues = new ArrayList<>();
+                    for (String col : columnNames) {
+                        rowValues.add(row.get(col));
+                    }
+                    matches = stmt.whereClause.evaluate(columnNames, rowValues);
+                }
+
+                if (matches) {
+                    tableManager.deleteRow(stmt.tableName, schema, z);
+                    deleted++;
+                }
             }
+            tableManager.getBlockOperator().flush();
+
             if (autoCommit) txnManager.commit();
         } catch (Exception e) {
             if (autoCommit) txnManager.rollback();
@@ -382,7 +410,7 @@ public class SqlExecutor {
             return QueryResult.error("Delete failed: " + e.getMessage());
         }
 
-        return QueryResult.ok(toDelete.size() + " row(s) deleted from '" + stmt.tableName + "'");
+        return QueryResult.ok(deleted + " row(s) deleted from '" + stmt.tableName + "'");
     }
 
     private QueryResult executeShowTables() {

@@ -121,6 +121,14 @@ public class TableManager {
         return rows;
     }
 
+    /**
+     * 行扫描上界（已分配的下一个 z）。行号从 1 起，遍历 z=1..maxZ-1。
+     */
+    public long getMaxZ(String tableName) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
+        return coords != null ? coords.nextZ : 1;
+    }
+
     public Map<String, Object> readRow(String tableName, List<ColumnDefinition> schema, int z) {
         CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
         if (coords == null) return null;
@@ -149,6 +157,10 @@ public class TableManager {
         return hasData ? row : null;
     }
 
+    /**
+     * 更新一行中出现的列（newData 里没有的列保持原样，不再整行重写）。
+     * 不做内部 flush：多行 UPDATE 由执行器合并为一次批量 flush。
+     */
     public void updateRow(String tableName, List<ColumnDefinition> schema, long z, Map<String, Object> newData) {
         CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
         if (coords == null) throw new IllegalStateException("Table not found: " + tableName);
@@ -157,6 +169,7 @@ public class TableManager {
 
         for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
             ColumnDefinition colDef = schema.get(colIdx);
+            if (!newData.containsKey(colDef.name)) continue;
             Object value = newData.get(colDef.name);
             int x = coords.xStart + colIdx;
 
@@ -172,8 +185,6 @@ public class TableManager {
                 blockOp.writeWool(x, WorldUtils.DATA_START_Y + dy, (int) z, colorSeq.get(dy));
             }
         }
-
-        blockOp.flush();
     }
 
     public void deleteRow(String tableName, List<ColumnDefinition> schema, long z) {
@@ -187,8 +198,6 @@ public class TableManager {
                 blockOp.clearBlock(x, y, (int) z);
             }
         }
-
-        blockOp.flush();
     }
 
     // === Encoding/Decoding helpers ===

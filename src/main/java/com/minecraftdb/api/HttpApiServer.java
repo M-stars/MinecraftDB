@@ -227,18 +227,36 @@ public class HttpApiServer {
                 sendJson(exchange, 404, Map.of("error", "Table not found: " + tableName));
                 return;
             }
-            List<com.minecraftdb.database.TableManager.RowWithZ> allRows = dbManager.callOnServerThread(
-                    () -> dbManager.getTableManager().readAllRows(tableName, schema));
-            int total = allRows.size();
-            int end = Math.min(offset + limit, total);
-            List<Map<String, Object>> page = new ArrayList<>();
-            for (int i = offset; i < end; i++) {
-                page.add(allRows.get(i).values());
-            }
-            sendJson(exchange, 200, Map.of(
-                    "table", tableName, "rows", page,
-                    "total", total, "limit", limit, "offset", offset
-            ));
+            // 分页下推为 z 范围：只扫描到取满一页为止，不再全表物化
+            Map<String, Object> result = dbManager.callOnServerThread(() -> {
+                com.minecraftdb.database.TableManager tm = dbManager.getTableManager();
+                long maxZ = tm.getMaxZ(tableName);
+                List<Map<String, Object>> page = new ArrayList<>();
+                int skipped = 0;
+                boolean hasMore = false;
+                for (int z = 1; z < maxZ; z++) {
+                    Map<String, Object> row = tm.readRow(tableName, schema, z);
+                    if (row == null || row.isEmpty()) continue;
+                    if (skipped < offset) {
+                        skipped++;
+                        continue;
+                    }
+                    if (page.size() < limit) {
+                        page.add(row);
+                    } else {
+                        hasMore = true;
+                        break;
+                    }
+                }
+                Map<String, Object> out = new LinkedHashMap<>();
+                out.put("table", tableName);
+                out.put("rows", page);
+                out.put("limit", limit);
+                out.put("offset", offset);
+                out.put("hasMore", hasMore);
+                return out;
+            });
+            sendJson(exchange, 200, result);
         }
 
         private String extractSegment(String path, String prefix, String suffix) {
