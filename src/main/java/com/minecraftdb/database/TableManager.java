@@ -97,17 +97,23 @@ public class TableManager {
         blockOp.flush();
     }
 
-    public List<Map<String, Object>> readAllRows(String tableName, List<ColumnDefinition> schema) {
+    /**
+     * 一行数据及其在世界上真实的 Z 坐标。
+     * 已删除的行（空行）不进入结果，列表下标 ≠ z 坐标，写回时必须用这里的 z。
+     */
+    public record RowWithZ(long z, Map<String, Object> values) {}
+
+    public List<RowWithZ> readAllRows(String tableName, List<ColumnDefinition> schema) {
         CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
         if (coords == null) return Collections.emptyList();
 
-        List<Map<String, Object>> rows = new ArrayList<>();
+        List<RowWithZ> rows = new ArrayList<>();
         long maxZ = coords.nextZ;
 
         for (int z = 1; z < maxZ; z++) {
             Map<String, Object> row = readRow(tableName, schema, z);
             if (row != null && !row.isEmpty()) {
-                rows.add(row);
+                rows.add(new RowWithZ(z, row));
             }
         }
 
@@ -142,11 +148,10 @@ public class TableManager {
         return hasData ? row : null;
     }
 
-    public void updateRow(String tableName, List<ColumnDefinition> schema, int rowIndex, Map<String, Object> newData) {
+    public void updateRow(String tableName, List<ColumnDefinition> schema, long z, Map<String, Object> newData) {
         CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
         if (coords == null) throw new IllegalStateException("Table not found: " + tableName);
 
-        int z = rowIndex + 1; // Z starts at 1
         int maxLayers = WorldUtils.DATA_MAX_Y - WorldUtils.DATA_START_Y + 1;
 
         for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
@@ -156,31 +161,29 @@ public class TableManager {
 
             // 整列先清为空气再写新数据，避免新数据比旧数据短时残留上层旧色
             for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
-                blockOp.clearBlock(x, y, z);
+                blockOp.clearBlock(x, y, (int) z);
             }
 
             // Write new data
             List<DyeColor> colorSeq = encodeValue(value, colDef.dataType);
             int layers = Math.min(colorSeq.size(), maxLayers);
             for (int dy = 0; dy < layers; dy++) {
-                blockOp.writeWool(x, WorldUtils.DATA_START_Y + dy, z, colorSeq.get(dy));
+                blockOp.writeWool(x, WorldUtils.DATA_START_Y + dy, (int) z, colorSeq.get(dy));
             }
         }
 
         blockOp.flush();
     }
 
-    public void deleteRow(String tableName, List<ColumnDefinition> schema, int rowIndex) {
+    public void deleteRow(String tableName, List<ColumnDefinition> schema, long z) {
         CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
         if (coords == null) return;
-
-        int z = rowIndex + 1;
 
         // 整行所有列清为空气（空气 = 空行，读取时跳过）
         for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
             int x = coords.xStart + colIdx;
             for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
-                blockOp.clearBlock(x, y, z);
+                blockOp.clearBlock(x, y, (int) z);
             }
         }
 

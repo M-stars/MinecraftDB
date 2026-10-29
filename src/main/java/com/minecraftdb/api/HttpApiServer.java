@@ -222,12 +222,13 @@ public class HttpApiServer {
                 sendJson(exchange, 404, Map.of("error", "Table not found: " + tableName));
                 return;
             }
-            List<Map<String, Object>> allRows = dbManager.getTableManager().readAllRows(tableName, schema);
+            List<com.minecraftdb.database.TableManager.RowWithZ> allRows =
+                    dbManager.getTableManager().readAllRows(tableName, schema);
             int total = allRows.size();
             int end = Math.min(offset + limit, total);
             List<Map<String, Object>> page = new ArrayList<>();
             for (int i = offset; i < end; i++) {
-                page.add(allRows.get(i));
+                page.add(allRows.get(i).values());
             }
             sendJson(exchange, 200, Map.of(
                     "table", tableName, "rows", page,

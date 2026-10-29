@@ -182,11 +182,12 @@ public class SqlExecutor {
             columnNames.add(cd.name);
         }
 
-        List<Map<String, Object>> allRows = tableManager.readAllRows(stmt.tableName, schema);
+        List<TableManager.RowWithZ> allRows = tableManager.readAllRows(stmt.tableName, schema);
 
         // Apply WHERE filter
         List<Map<String, Object>> filteredRows = new ArrayList<>();
-        for (Map<String, Object> row : allRows) {
+        for (TableManager.RowWithZ rowWithZ : allRows) {
+            Map<String, Object> row = rowWithZ.values();
             if (row == null || row.isEmpty()) continue;
             if (stmt.whereClause == null) {
                 filteredRows.add(row);
@@ -240,15 +241,15 @@ public class SqlExecutor {
             columnNames.add(cd.name);
         }
 
-        List<Map<String, Object>> allRows = tableManager.readAllRows(stmt.tableName, schema);
+        List<TableManager.RowWithZ> allRows = tableManager.readAllRows(stmt.tableName, schema);
 
         int updated = 0;
         boolean autoCommit = !txnManager.isInTransaction();
         if (autoCommit) txnManager.begin();
 
         try {
-            for (int rowIdx = 0; rowIdx < allRows.size(); rowIdx++) {
-                Map<String, Object> row = allRows.get(rowIdx);
+            for (TableManager.RowWithZ rowWithZ : allRows) {
+                Map<String, Object> row = rowWithZ.values();
                 if (row == null || row.isEmpty()) continue;
 
                 boolean matches = true;
@@ -268,7 +269,7 @@ public class SqlExecutor {
                             row.put(assign.getKey(), parsedValue);
                         }
                     }
-                    tableManager.updateRow(stmt.tableName, schema, rowIdx, row);
+                    tableManager.updateRow(stmt.tableName, schema, rowWithZ.z(), row);
                     updated++;
                 }
             }
@@ -301,12 +302,12 @@ public class SqlExecutor {
             columnNames.add(cd.name);
         }
 
-        // For deletion, we mark rows as deleted (set to air/null wool)
-        List<Map<String, Object>> allRows = tableManager.readAllRows(stmt.tableName, schema);
-        List<Integer> toDelete = new ArrayList<>();
+        // For deletion, we mark rows as deleted (set to air)
+        List<TableManager.RowWithZ> allRows = tableManager.readAllRows(stmt.tableName, schema);
+        List<Long> toDelete = new ArrayList<>();
 
-        for (int rowIdx = 0; rowIdx < allRows.size(); rowIdx++) {
-            Map<String, Object> row = allRows.get(rowIdx);
+        for (TableManager.RowWithZ rowWithZ : allRows) {
+            Map<String, Object> row = rowWithZ.values();
             if (row == null || row.isEmpty()) continue;
 
             boolean matches = true;
@@ -319,7 +320,7 @@ public class SqlExecutor {
             }
 
             if (matches) {
-                toDelete.add(rowIdx);
+                toDelete.add(rowWithZ.z());
             }
         }
 
@@ -327,8 +328,8 @@ public class SqlExecutor {
         if (autoCommit) txnManager.begin();
 
         try {
-            for (int rowIdx : toDelete) {
-                tableManager.deleteRow(stmt.tableName, schema, rowIdx);
+            for (long z : toDelete) {
+                tableManager.deleteRow(stmt.tableName, schema, z);
             }
             if (autoCommit) txnManager.commit();
         } catch (Exception e) {
