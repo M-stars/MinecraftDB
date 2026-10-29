@@ -1,5 +1,6 @@
 package com.minecraftdb.storage;
 
+import com.minecraftdb.database.TransactionManager;
 import com.minecraftdb.util.WorldUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
@@ -12,15 +13,18 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Encapsulates block read/write operations with batching support.
+ * 所有变更在应用时记录进当前事务的 WAL（旧颜色 → 新颜色），供回滚与崩溃恢复使用。
  */
 public class BlockOperator {
 
     private final ServerLevel level;
     private final boolean batchMode;
+    private final TransactionManager txnManager;
     private final Queue<PendingBlock> pendingQueue = new ConcurrentLinkedQueue<>();
 
-    public BlockOperator(ServerLevel level) {
+    public BlockOperator(ServerLevel level, TransactionManager txnManager) {
         this.level = level;
+        this.txnManager = txnManager;
         this.batchMode = true;
     }
 
@@ -38,18 +42,18 @@ public class BlockOperator {
         if (batchMode) {
             pendingQueue.add(new PendingBlock(pos, color));
         } else {
-            WorldUtils.setWool(level, pos, color);
+            applyWrite(pos, color);
         }
     }
 
     /**
-     * 将方块清除为空气。color 为 null 的 PendingBlock 表示清除操作。
+     * 将方块清除为空气。批量队列中以 color == null 表示清除操作。
      */
     public void clearBlock(BlockPos pos) {
         if (batchMode) {
             pendingQueue.add(new PendingBlock(pos, null));
         } else {
-            WorldUtils.setAir(level, pos);
+            applyWrite(pos, null);
         }
     }
 
@@ -80,22 +84,40 @@ public class BlockOperator {
      */
     public void flush() {
         PendingBlock pb;
-        int count = 0;
         while ((pb = pendingQueue.poll()) != null) {
-            if (pb.color() == null) {
-                WorldUtils.setAir(level, pb.pos());
-            } else {
-                WorldUtils.setWool(level, pb.pos(), pb.color());
-            }
-            count++;
+            applyWrite(pb.pos(), pb.color());
         }
-        if (count > 0) {
-            // Log only for large batches to avoid spam
-        }
+    }
+
+    /**
+     * 丢弃尚未应用（未 flush）的批量写入。语句失败回滚后必须调用，
+     * 否则队列里的残留写入会在下一次 flush 时静默落到世界。
+     */
+    public void clearPending() {
+        pendingQueue.clear();
     }
 
     public int pendingCount() {
         return pendingQueue.size();
+    }
+
+    /**
+     * 应用单个方块变更：读取旧颜色 → 记录 WAL → 落盘。目标状态相同则跳过。
+     */
+    private void applyWrite(BlockPos pos, DyeColor color) {
+        DyeColor old = WorldUtils.getWoolColor(level, pos);
+        if (old == color) return;
+
+        if (txnManager != null) {
+            txnManager.logBlockChange("", pos.getX(), pos.getY(), pos.getZ(),
+                    old == null ? null : old.name(),
+                    color == null ? null : color.name());
+        }
+        if (color == null) {
+            WorldUtils.setAir(level, pos);
+        } else {
+            WorldUtils.setWool(level, pos, color);
+        }
     }
 
     // === Read operations ===

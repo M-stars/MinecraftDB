@@ -2,19 +2,35 @@ package com.minecraftdb.database;
 
 import com.google.gson.Gson;
 import com.minecraftdb.config.ModConfig;
+import com.minecraftdb.util.WorldUtils;
+import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.DyeColor;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * ACID 事务管理器（MVCC + WAL + 锁管理）。
- * WAL 日志存储在 config/minecraftdb/wal/ 目录下。
+ * ACID 事务管理器（WAL + 锁管理）。
+ *
+ * WAL 设计：每个事务一个文件 config/minecraftdb/wal/<世界名>/txn_<id>.wal，
+ * 逐行 JSON 追加：
+ *   BEGIN 行:  {"type":"BEGIN","txnId":1}
+ *   数据行:    {"type":"OP","txnId":1,"table":"users","x":1,"y":2,"z":3,"oldColor":"ORANGE","newColor":"AIR"}
+ *   COMMIT 行: {"type":"COMMIT","txnId":1}
+ *
+ * 提交流程：先追加 COMMIT 行再删除文件。崩溃恢复时：
+ *   - 文件存在且包含 COMMIT 行 → 事务已提交，保留数据，删除文件
+ *   - 否则 → 未提交，按逆序把每个 OP 的方块恢复为 oldColor（null 表示空气）
+ *
+ * 回滚不需要读文件：内存中的 walEntries 已包含本事务全部已应用变更，
+ * 逆序恢复即可；WAL 文件只服务于崩溃恢复。
  */
 public class TransactionManager {
 
@@ -56,7 +72,7 @@ public class TransactionManager {
         activeTransactions.put(txn.id, txn);
 
         if (walEnabled) {
-            saveWALFile(txn.id, new WALLog("BEGIN", txn.id, null, null));
+            writeWALLine(txn.id, WALEntry.begin(txn.id), true);
         }
     }
 
@@ -67,7 +83,8 @@ public class TransactionManager {
         }
 
         if (walEnabled) {
-            saveWALFile(txn.id, new WALLog("COMMIT", txn.id, null, null));
+            // 先落盘 COMMIT 再删除文件：崩溃窗口内恢复程序会认为事务已提交（保留数据）
+            writeWALLine(txn.id, WALEntry.commit(txn.id), false);
             deleteWALFile(txn.id);
         }
 
@@ -82,14 +99,11 @@ public class TransactionManager {
             throw new IllegalStateException("没有活跃事务");
         }
 
+        // 逆序恢复所有已应用的方块变更
+        for (int i = txn.walEntries.size() - 1; i >= 0; i--) {
+            restoreEntry(txn.walEntries.get(i));
+        }
         if (walEnabled) {
-            // 从 WAL 文件读取并逆向恢复
-            WALLog log = loadWALFile(txn.id);
-            if (log != null) {
-                for (WALEntry entry : log.entries) {
-                    revertWALEntry(entry);
-                }
-            }
             deleteWALFile(txn.id);
         }
 
@@ -104,6 +118,33 @@ public class TransactionManager {
 
     public Transaction getCurrentTransaction() {
         return currentTxn.get();
+    }
+
+    // === 方块变更日志 ===
+
+    /**
+     * 记录一次方块变更，必须在变更落盘之前调用。
+     * oldColor/newColor 为 DyeColor 枚举名，null 表示空气。
+     * 无论 WAL 是否启用都写入内存列表（回滚需要）；WAL 启用时同步追加到文件。
+     */
+    public void logBlockChange(String tableName, int x, int y, int z, String oldColor, String newColor) {
+        Transaction txn = currentTxn.get();
+        if (txn == null) return;
+
+        WALEntry entry = WALEntry.op(txn.id, tableName, x, y, z, oldColor, newColor);
+        txn.walEntries.add(entry);
+        if (walEnabled) {
+            writeWALLine(txn.id, entry, false);
+        }
+    }
+
+    private void restoreEntry(WALEntry entry) {
+        BlockPos pos = new BlockPos(entry.x, entry.y, entry.z);
+        if (entry.oldColor == null) {
+            level.removeBlock(pos, false);
+        } else {
+            WorldUtils.setWool(level, pos, DyeColor.valueOf(entry.oldColor));
+        }
     }
 
     private void releaseAllLocks(Transaction txn) {
@@ -170,49 +211,27 @@ public class TransactionManager {
 
     // === WAL 文件操作 ===
 
-    public void logOperation(String tableName, int x, int y, int z, String oldValue, String newValue) {
-        if (!walEnabled) return;
-
-        Transaction txn = currentTxn.get();
-        if (txn == null) return;
-
-        WALEntry entry = new WALEntry(tableName, x, y, z, oldValue, newValue);
-        txn.walEntries.add(entry);
-    }
-
-    private void saveWALFile(long txnId, WALLog log) {
+    private void writeWALLine(long txnId, WALEntry entry, boolean truncate) {
         try {
-            String json = gson.toJson(log);
-            Files.writeString(walDir.resolve("txn_" + txnId + ".json"), json);
+            Path file = walDir.resolve("txn_" + txnId + ".wal");
+            if (truncate) {
+                Files.writeString(file, gson.toJson(entry) + System.lineSeparator(),
+                        StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+            } else {
+                Files.writeString(file, gson.toJson(entry) + System.lineSeparator(),
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            }
         } catch (IOException ignored) {}
-    }
-
-    private WALLog loadWALFile(long txnId) {
-        try {
-            Path file = walDir.resolve("txn_" + txnId + ".json");
-            if (!Files.exists(file)) return null;
-            String json = Files.readString(file);
-            return gson.fromJson(json, WALLog.class);
-        } catch (IOException e) {
-            return null;
-        }
     }
 
     private void deleteWALFile(long txnId) {
         try {
-            Files.deleteIfExists(walDir.resolve("txn_" + txnId + ".json"));
+            Files.deleteIfExists(walDir.resolve("txn_" + txnId + ".wal"));
         } catch (IOException ignored) {}
     }
 
-    private void revertWALEntry(WALEntry entry) {
-        // 恢复旧的羊毛颜色（通过重新放置方块实现）
-        if (entry.oldValue != null) {
-            // 在事务回滚时，TableManager 会负责重新写入数据
-        }
-    }
-
     /**
-     * 服务端启动时恢复未完成的事务
+     * 服务端启动时恢复未完成的事务（在主线程、任何数据读取之前调用）。
      */
     public void recoverFromWAL() {
         if (!walEnabled) return;
@@ -221,22 +240,30 @@ public class TransactionManager {
             if (!Files.exists(walDir)) return;
 
             try (var files = Files.list(walDir)) {
-                files.filter(f -> f.getFileName().toString().startsWith("txn_")
-                                  && f.getFileName().toString().endsWith(".json"))
+                files.filter(f -> f.getFileName().toString().startsWith("txn_"))
                      .forEach(f -> {
                          try {
-                             String json = Files.readString(f);
-                             WALLog log = gson.fromJson(json, WALLog.class);
-                             if (log != null && !"COMMIT".equals(log.type)) {
-                                 // 未提交的事务，执行回滚
-                                 if (log.entries != null) {
-                                     for (WALEntry entry : log.entries) {
-                                         revertWALEntry(entry);
-                                     }
+                             List<WALEntry> entries = new ArrayList<>();
+                             boolean committed = false;
+                             for (String line : Files.readAllLines(f)) {
+                                 if (line.isBlank()) continue;
+                                 WALEntry e = gson.fromJson(line, WALEntry.class);
+                                 if (e == null) continue;
+                                 if ("COMMIT".equals(e.type)) {
+                                     committed = true;
+                                     break;
+                                 }
+                                 if ("OP".equals(e.type)) {
+                                     entries.add(e);
+                                 }
+                             }
+                             if (!committed) {
+                                 for (int i = entries.size() - 1; i >= 0; i--) {
+                                     restoreEntry(entries.get(i));
                                  }
                              }
                              Files.deleteIfExists(f);
-                         } catch (IOException ignored) {}
+                         } catch (Exception ignored) {}
                      });
             }
         } catch (IOException ignored) {}
@@ -261,40 +288,42 @@ public class TransactionManager {
 
     public record RowLockKey(String table, long z) {}
 
+    /** WAL 行。type: BEGIN / OP / COMMIT；oldColor/newColor 为 null 表示空气。 */
     public static class WALEntry {
-        public String tableName;
-        public int x, y, z;
-        public String oldValue;
-        public String newValue;
-
-        public WALEntry() {}
-
-        public WALEntry(String tableName, int x, int y, int z, String oldValue, String newValue) {
-            this.tableName = tableName;
-            this.x = x;
-            this.y = y;
-            this.z = z;
-            this.oldValue = oldValue;
-            this.newValue = newValue;
-        }
-    }
-
-    public static class WALLog {
         public String type;
         public long txnId;
         public String table;
-        public List<WALEntry> entries;
+        public int x, y, z;
+        public String oldColor;
+        public String newColor;
 
-        public WALLog() {}
+        public WALEntry() {}
 
-        public WALLog(String type, long txnId, String table, WALEntry entry) {
-            this.type = type;
-            this.txnId = txnId;
-            this.table = table;
-            this.entries = new ArrayList<>();
-            if (entry != null) {
-                this.entries.add(entry);
-            }
+        public static WALEntry begin(long txnId) {
+            WALEntry e = new WALEntry();
+            e.type = "BEGIN";
+            e.txnId = txnId;
+            return e;
+        }
+
+        public static WALEntry commit(long txnId) {
+            WALEntry e = new WALEntry();
+            e.type = "COMMIT";
+            e.txnId = txnId;
+            return e;
+        }
+
+        public static WALEntry op(long txnId, String table, int x, int y, int z, String oldColor, String newColor) {
+            WALEntry e = new WALEntry();
+            e.type = "OP";
+            e.txnId = txnId;
+            e.table = table;
+            e.x = x;
+            e.y = y;
+            e.z = z;
+            e.oldColor = oldColor;
+            e.newColor = newColor;
+            return e;
         }
     }
 }

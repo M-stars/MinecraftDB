@@ -23,10 +23,11 @@ public class TableManager {
     private final BlockOperator blockOp;
     private final DatabaseManager dbManager;
 
-    public TableManager(ServerLevel level, CoordinateAllocator coordAllocator, DatabaseManager dbManager) {
+    public TableManager(ServerLevel level, CoordinateAllocator coordAllocator, DatabaseManager dbManager,
+                        TransactionManager txnManager) {
         this.level = level;
         this.coordAllocator = coordAllocator;
-        this.blockOp = new BlockOperator(level);
+        this.blockOp = new BlockOperator(level, txnManager);
         this.dbManager = dbManager;
     }
 

@@ -43,11 +43,12 @@ public class DatabaseManager {
         this.databaseLevel = found;
         this.databaseName = extractWorldName(found);
 
-        // 初始化子系统
+        // 初始化子系统（transactionManager 必须先于 tableManager：BlockOperator 的
+        // 方块写入路径依赖它记录 WAL）
         this.coordAllocator = new CoordinateAllocator();
-        this.tableManager = new TableManager(databaseLevel, coordAllocator, this);
-        this.schemaManager = new SchemaManager(databaseLevel, coordAllocator);
         this.transactionManager = new TransactionManager(databaseLevel);
+        this.tableManager = new TableManager(databaseLevel, coordAllocator, this, transactionManager);
+        this.schemaManager = new SchemaManager(databaseLevel, coordAllocator);
         this.sqlExecutor = new SqlExecutor(this);
 
         // 从文件恢复表坐标注册表
