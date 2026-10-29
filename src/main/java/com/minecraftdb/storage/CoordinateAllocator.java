@@ -74,18 +74,11 @@ public class CoordinateAllocator {
     }
 
     public synchronized void remove(String tableName) {
-        TableCoords removed = tableCoords.remove(tableName);
+        // 仅解除注册：不平移其他表坐标、不回退 nextXStart。
+        // 世界里的羊毛块不会移动，若平移坐标，被删表之后的所有表都会指向错误区域（数据丢失/错位）。
+        // 被删表占用的 X 区间保留为空洞，新表继续向后分配。
+        tableCoords.remove(tableName);
         coordCache.remove(tableName);
-        if (removed != null) {
-            int width = removed.xEnd - removed.xStart + 1;
-            for (TableCoords tc : tableCoords.values()) {
-                if (tc.xStart > removed.xEnd) {
-                    tc.xStart -= (width + 10);
-                    tc.xEnd -= (width + 10);
-                }
-            }
-            nextXStart -= (width + 10);
-        }
     }
 
     public Set<String> getTableNames() {
