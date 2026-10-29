@@ -19,7 +19,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * ACID 事务管理器（WAL + 锁管理）。
+ * ACID 事务管理器（WAL + 锁管理），按客户端会话隔离事务。
+ *
+ * 会话模型：每个客户端（游戏内玩家、TCP 连接、携带 X-MinecraftDB-Session 的 HTTP 客户端）
+ * 拥有独立的会话 ID 与独立事务。SqlExecutor 在每次执行语句前通过 setCurrentSession 标明
+ * 语句所属会话——所有语句统一在服务端主线程串行执行，因此用 ThreadLocal 承载
+ * "当前会话"是安全的。
  *
  * WAL 设计：每个事务一个文件 config/minecraftdb/wal/<世界名>/txn_<id>.wal，
  * 逐行 JSON：
@@ -27,8 +32,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *   数据行:    {"type":"OP","txnId":1,"table":"users","x":1,"y":2,"z":3,"oldColor":"ORANGE","newColor":"AIR"}
  *   COMMIT 行: {"type":"COMMIT","txnId":1}
  *
- * 写入经 BufferedWriter 缓冲：每条 OP 只做一次 write 调用（无逐条打开/关闭文件的
- * syscall 开销），由 flushWALBuffer() 在语句边界把缓冲推到操作系统。
+ * 写入经事务私有的 BufferedWriter 缓冲：每条 OP 只做一次 write 调用，
+ * 由 flushWALBuffer() 在语句边界把缓冲推到操作系统。
  *
  * 提交流程：追加 COMMIT 行并 flush 后关闭、删除文件。若 flush/写 COMMIT 失败，
  * 保留文件、抛出异常、事务保持开启（COMMIT 行不存在 → 崩溃恢复会回滚）。
@@ -36,6 +41,9 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *   - 文件存在且包含 COMMIT 行 → 事务已提交，保留数据，删除文件
  *   - 否则 → 未提交，按逆序把每个 OP 的方块恢复为 oldColor（null 表示空气）
  *   - 解析损坏的文件改名保留为 .corrupt，不做部分恢复也不删除
+ *
+ * 已知限制：所有会话的语句在同一个主线程串行执行，且锁为线程级可重入——
+ * 因此一个会话未提交的写入对其他会话可见（无 MVCC 快照）。
  */
 public class TransactionManager {
 
@@ -48,13 +56,11 @@ public class TransactionManager {
     private final Map<String, ReentrantReadWriteLock> tableLocks = new ConcurrentHashMap<>();
     private final Map<String, Map<Long, ReentrantReadWriteLock>> rowLocks = new ConcurrentHashMap<>();
 
-    // 事务状态
-    private final ThreadLocal<Transaction> currentTxn = new ThreadLocal<>();
-    private final Map<Long, Transaction> activeTransactions = new ConcurrentHashMap<>();
+    // 会话 → 活跃事务
+    private final Map<String, Transaction> activeTxns = new ConcurrentHashMap<>();
+    // 当前正在执行语句的会话（仅在主线程上读写）
+    private final ThreadLocal<String> currentSession = new ThreadLocal<>();
     private long nextTxnId = 1;
-
-    // 当前线程事务的 WAL 写入器（与 currentTxn 同为线程绑定）
-    private final ThreadLocal<BufferedWriter> walWriter = new ThreadLocal<>();
 
     public TransactionManager(ServerLevel level) {
         this.level = level;
@@ -69,59 +75,92 @@ public class TransactionManager {
         return level.dimension().location().getPath();
     }
 
+    // === 会话绑定 ===
+
+    /**
+     * 由 SqlExecutor 在每次执行语句前调用：标识语句所属的客户端会话。
+     * begin/commit/rollback/logBlockChange 都作用于该会话的事务。
+     */
+    public void setCurrentSession(String sessionId) {
+        currentSession.set(sessionId);
+    }
+
+    public void clearCurrentSession() {
+        currentSession.remove();
+    }
+
+    private String requireSession() {
+        String session = currentSession.get();
+        if (session == null) {
+            throw new IllegalStateException("未设置数据库会话（编程错误）");
+        }
+        return session;
+    }
+
+    private Transaction currentTxn() {
+        String session = currentSession.get();
+        return session != null ? activeTxns.get(session) : null;
+    }
+
+    public boolean isInTransaction() {
+        return currentTxn() != null;
+    }
+
     // === 事务生命周期 ===
 
     public void begin() {
-        if (currentTxn.get() != null) {
-            throw new IllegalStateException("已有活跃事务");
+        String session = requireSession();
+        if (activeTxns.containsKey(session)) {
+            throw new IllegalStateException("会话已有活跃事务，请先 COMMIT 或 ROLLBACK");
         }
         Transaction txn = new Transaction(nextTxnId++);
-        currentTxn.set(txn);
-        activeTransactions.put(txn.id, txn);
+        activeTxns.put(session, txn);
 
         if (walEnabled) {
             try {
-                openWALWriter(txn.id, true);
-                writeWALLine(WALEntry.begin(txn.id));
-                flushWALBuffer();
+                txnOpenWal(txn, true);
+                txnWriteLine(txn, WALEntry.begin(txn.id));
+                txnFlushWal(txn);
             } catch (IOException e) {
-                closeWALWriter();
+                txnCloseWal(txn);
+                activeTxns.remove(session);
                 throw new RuntimeException("WAL 初始化失败，无法开始事务", e);
             }
         }
     }
 
     public void commit() {
-        Transaction txn = currentTxn.get();
+        String session = requireSession();
+        Transaction txn = currentTxn();
         if (txn == null) {
             throw new IllegalStateException("没有活跃事务");
         }
 
         if (walEnabled) {
             try {
-                writeWALLine(WALEntry.commit(txn.id));
-                flushWALBuffer();
+                txnWriteLine(txn, WALEntry.commit(txn.id));
+                txnFlushWal(txn);
             } catch (IOException e) {
                 // 保留 WAL 文件（无 COMMIT 行），崩溃恢复时按未提交回滚
-                closeWALWriter();
+                txnCloseWal(txn);
                 throw new RuntimeException("WAL 提交失败，事务未提交，请 ROLLBACK 后重试", e);
             }
-            closeWALWriter();
+            txnCloseWal(txn);
             deleteWALFile(txn.id);
         }
 
         releaseAllLocks(txn);
-        activeTransactions.remove(txn.id);
-        currentTxn.remove();
+        activeTxns.remove(session);
     }
 
     public void rollback() {
-        Transaction txn = currentTxn.get();
+        String session = requireSession();
+        Transaction txn = currentTxn();
         if (txn == null) {
             throw new IllegalStateException("没有活跃事务");
         }
 
-        closeWALWriter();
+        txnCloseWal(txn);
         if (walEnabled) {
             deleteWALFile(txn.id);
         }
@@ -132,12 +171,7 @@ public class TransactionManager {
         }
 
         releaseAllLocks(txn);
-        activeTransactions.remove(txn.id);
-        currentTxn.remove();
-    }
-
-    public boolean isInTransaction() {
-        return currentTxn.get() != null;
+        activeTxns.remove(session);
     }
 
     // === 方块变更日志 ===
@@ -145,22 +179,18 @@ public class TransactionManager {
     /**
      * 记录一次方块变更，必须在变更落盘之前调用。
      * oldColor/newColor 为 DyeColor 枚举名，null 表示空气。
-     * 无论 WAL 是否启用都写入内存列表（回滚需要）；WAL 启用时写入文件缓冲。
-     * IO 失败直接抛出：调用方（BlockOperator → SqlExecutor）会中止并回滚当前事务，
-     * 避免"日志缺失但数据已写"的静默不一致。
+     * 无论 WAL 是否启用都写入内存列表（回滚需要）；WAL 启用时写入事务私有缓冲。
+     * IO 失败直接抛出：调用方（BlockOperator → SqlExecutor）会中止并回滚当前事务。
      */
     public void logBlockChange(String tableName, int x, int y, int z, String oldColor, String newColor) {
-        Transaction txn = currentTxn.get();
+        Transaction txn = currentTxn();
         if (txn == null) return;
 
         WALEntry entry = WALEntry.op(txn.id, tableName, x, y, z, oldColor, newColor);
         txn.walEntries.add(entry);
         if (walEnabled) {
             try {
-                if (walWriter.get() == null) {
-                    openWALWriter(txn.id, false);
-                }
-                writeWALLine(entry);
+                txnWriteLine(txn, entry);
             } catch (IOException e) {
                 throw new RuntimeException("WAL 写入失败，中止当前事务", e);
             }
@@ -168,14 +198,14 @@ public class TransactionManager {
     }
 
     /**
-     * 把 WAL 缓冲推到操作系统。方块批量写入（语句边界）后调用，
+     * 把当前事务的 WAL 缓冲推到操作系统。方块批量写入（语句边界）后调用，
      * 保证已应用到世界的数据都有对应的持久日志。
      */
     public void flushWALBuffer() {
-        BufferedWriter writer = walWriter.get();
-        if (writer != null) {
+        Transaction txn = currentTxn();
+        if (txn != null && txn.walWriter != null) {
             try {
-                writer.flush();
+                txn.walWriter.flush();
             } catch (IOException e) {
                 throw new RuntimeException("WAL 刷写失败，中止当前事务", e);
             }
@@ -210,7 +240,7 @@ public class TransactionManager {
     public void acquireTableReadLock(String tableName) {
         ReentrantReadWriteLock lock = tableLocks.computeIfAbsent(tableName, k -> new ReentrantReadWriteLock());
         lock.readLock().lock();
-        Transaction txn = currentTxn.get();
+        Transaction txn = currentTxn();
         if (txn != null) {
             txn.acquiredTableReadLocks.add(tableName);
         }
@@ -224,7 +254,7 @@ public class TransactionManager {
     public void acquireTableWriteLock(String tableName) {
         ReentrantReadWriteLock lock = tableLocks.computeIfAbsent(tableName, k -> new ReentrantReadWriteLock());
         lock.writeLock().lock();
-        Transaction txn = currentTxn.get();
+        Transaction txn = currentTxn();
         if (txn != null) {
             txn.acquiredTableWriteLocks.add(tableName);
         }
@@ -239,7 +269,7 @@ public class TransactionManager {
         Map<Long, ReentrantReadWriteLock> rowLockMap = rowLocks.computeIfAbsent(tableName, k -> new ConcurrentHashMap<>());
         ReentrantReadWriteLock lock = rowLockMap.computeIfAbsent(z, k -> new ReentrantReadWriteLock());
         lock.writeLock().lock();
-        Transaction txn = currentTxn.get();
+        Transaction txn = currentTxn();
         if (txn != null) {
             txn.acquiredRowLocks.add(new RowLockKey(tableName, z));
         }
@@ -253,29 +283,36 @@ public class TransactionManager {
         }
     }
 
-    // === WAL 文件操作 ===
+    // === WAL 文件操作（挂在事务上：多个会话的事务可同时开启） ===
 
-    private void openWALWriter(long txnId, boolean truncate) throws IOException {
-        closeWALWriter();
-        Path file = walDir.resolve("txn_" + txnId + ".wal");
-        walWriter.set(Files.newBufferedWriter(file, StandardCharsets.UTF_8,
+    private void txnOpenWal(Transaction txn, boolean truncate) throws IOException {
+        txnCloseWal(txn);
+        Path file = walDir.resolve("txn_" + txn.id + ".wal");
+        txn.walWriter = Files.newBufferedWriter(file, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE,
-                truncate ? StandardOpenOption.TRUNCATE_EXISTING : StandardOpenOption.APPEND));
+                truncate ? StandardOpenOption.TRUNCATE_EXISTING : StandardOpenOption.APPEND);
     }
 
-    private void writeWALLine(WALEntry entry) throws IOException {
-        BufferedWriter writer = walWriter.get();
-        writer.write(gson.toJson(entry));
-        writer.write(System.lineSeparator());
+    private void txnWriteLine(Transaction txn, WALEntry entry) throws IOException {
+        if (txn.walWriter == null) {
+            txnOpenWal(txn, false);
+        }
+        txn.walWriter.write(gson.toJson(entry));
+        txn.walWriter.write(System.lineSeparator());
     }
 
-    private void closeWALWriter() {
-        BufferedWriter writer = walWriter.get();
-        if (writer != null) {
+    private void txnFlushWal(Transaction txn) throws IOException {
+        if (txn.walWriter != null) {
+            txn.walWriter.flush();
+        }
+    }
+
+    private void txnCloseWal(Transaction txn) {
+        if (txn.walWriter != null) {
             try {
-                writer.close();
+                txn.walWriter.close();
             } catch (IOException ignored) {}
-            walWriter.remove();
+            txn.walWriter = null;
         }
     }
 
@@ -349,6 +386,7 @@ public class TransactionManager {
         public final List<String> acquiredTableWriteLocks = new ArrayList<>();
         public final List<RowLockKey> acquiredRowLocks = new ArrayList<>();
         public final List<WALEntry> walEntries = new ArrayList<>();
+        public BufferedWriter walWriter; // 事务私有 WAL 写入器
 
         public Transaction(long id) {
             this.id = id;

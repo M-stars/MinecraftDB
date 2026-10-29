@@ -107,17 +107,24 @@ public class DatabaseCommand {
     // === 快捷命令 ===
 
     private static int executeShortcut(CommandContext<CommandSourceStack> ctx, String sql) {
-        return executeSqlInternal(ctx.getSource(), sql);
+        return executeSqlInternal(ctx.getSource(), sessionId(ctx), sql);
     }
 
     // === SQL 执行 ===
 
-    private static int executeSql(CommandContext<CommandSourceStack> ctx) {
-        String sql = StringArgumentType.getString(ctx, "sql");
-        return executeSqlInternal(ctx.getSource(), sql);
+    /** 会话 ID：每个玩家独立事务，控制台共享 "console" 会话 */
+    private static String sessionId(CommandContext<CommandSourceStack> ctx) {
+        return ctx.getSource().getEntity() instanceof ServerPlayer sp
+                ? "player:" + sp.getUUID()
+                : "console";
     }
 
-    private static int executeSqlInternal(CommandSourceStack source, String sql) {
+    private static int executeSql(CommandContext<CommandSourceStack> ctx) {
+        String sql = StringArgumentType.getString(ctx, "sql");
+        return executeSqlInternal(ctx.getSource(), sessionId(ctx), sql);
+    }
+
+    private static int executeSqlInternal(CommandSourceStack source, String sessionId, String sql) {
         DatabaseManager dbManager = MinecraftDB.getDatabaseManager();
         if (dbManager == null) {
             source.sendFailure(Component.literal("数据库尚未初始化，请等待服务器完全启动。"));
@@ -125,7 +132,7 @@ public class DatabaseCommand {
         }
 
         try {
-            QueryResult result = dbManager.getSqlExecutor().execute(sql);
+            QueryResult result = dbManager.executeSql(sessionId, sql);
 
             if (result.isSuccess()) {
                 Component msg = formatResult(dbManager.getDatabaseName(), result);
@@ -178,7 +185,7 @@ public class DatabaseCommand {
         }
 
         try {
-            QueryResult result = dbManager.getSqlExecutor().execute(trimmed);
+            QueryResult result = dbManager.executeSql("player:" + player.getUUID(), trimmed);
             if (result.isSuccess()) {
                 player.sendSystemMessage(formatResult(dbManager.getDatabaseName(), result));
             } else {

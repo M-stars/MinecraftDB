@@ -20,11 +20,25 @@ public class SqlExecutor {
     }
 
     public QueryResult execute(String sql) {
-        SqlLexer lexer = new SqlLexer(sql);
-        List<SqlLexer.Token> tokens = lexer.tokenize();
-        SqlParser parser = new SqlParser(tokens);
-        Statement stmt = parser.parse();
-        return execute(stmt);
+        return execute(sql, null);
+    }
+
+    /**
+     * 执行 SQL。sessionId 标识客户端会话（玩家 UUID / TCP 连接 / HTTP 会话头），
+     * 会话各自拥有独立事务；null 表示服务器控制台。
+     */
+    public QueryResult execute(String sql, String sessionId) {
+        TransactionManager txnManager = dbManager.getTransactionManager();
+        txnManager.setCurrentSession(sessionId != null ? sessionId : "console");
+        try {
+            SqlLexer lexer = new SqlLexer(sql);
+            List<SqlLexer.Token> tokens = lexer.tokenize();
+            SqlParser parser = new SqlParser(tokens);
+            Statement stmt = parser.parse();
+            return execute(stmt);
+        } finally {
+            txnManager.clearCurrentSession();
+        }
     }
 
     public QueryResult execute(Statement stmt) {

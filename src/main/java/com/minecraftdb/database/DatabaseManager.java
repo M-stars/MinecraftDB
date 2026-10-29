@@ -149,9 +149,12 @@ public class DatabaseManager {
      * 在服务端主线程执行 SQL。HTTP/TCP 线程必须经由本方法访问数据库：
      * Minecraft 的 Level/setBlock 只允许主线程访问，跨线程读写 chunk
      * 会导致并发修改异常、崩溃或存档损坏。
+     *
+     * @param sessionId 客户端会话 ID（玩家 UUID / TCP 连接 / HTTP 会话头），
+     *                  各会话拥有独立事务；null 表示服务器控制台
      */
-    public SqlExecutor.QueryResult executeSql(String sql) {
-        return callOnServerThread(() -> sqlExecutor.execute(sql));
+    public SqlExecutor.QueryResult executeSql(String sessionId, String sql) {
+        return callOnServerThread(() -> sqlExecutor.execute(sql, sessionId));
     }
 
     /**

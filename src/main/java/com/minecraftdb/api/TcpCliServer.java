@@ -95,6 +95,8 @@ public class TcpCliServer {
             PrintWriter writer = new PrintWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8), true)
         ) {
             client.setSoTimeout(IDLE_TIMEOUT_MILLIS); // 空闲超时：read 抛 SocketTimeoutException 断开
+            // 每条连接一个会话：BEGIN/COMMIT/ROLLBACK 在本连接内独立生效
+            String session = "tcp:" + client.getRemoteSocketAddress();
             String dbName = dbManager.getDatabaseName();
             writer.println("");
             writer.println("╔══════════════════════════════════════════╗");
@@ -131,16 +133,16 @@ public class TcpCliServer {
                 }
 
                 if (trimmed.equalsIgnoreCase("tables")) {
-                    executeAndPrint(writer, "SHOW TABLES");
+                    executeAndPrint(writer, session, "SHOW TABLES");
                     continue;
                 }
 
                 if (trimmed.toLowerCase().startsWith("desc ")) {
-                    executeAndPrint(writer, "DESC " + trimmed.substring(5).trim());
+                    executeAndPrint(writer, session, "DESC " + trimmed.substring(5).trim());
                     continue;
                 }
 
-                executeAndPrint(writer, trimmed);
+                executeAndPrint(writer, session, trimmed);
             }
         } catch (IOException e) {
             // client disconnected
@@ -197,10 +199,11 @@ public class TcpCliServer {
         return false;
     }
 
-    private void executeAndPrint(PrintWriter writer, String sql) {
+    private void executeAndPrint(PrintWriter writer, String session, String sql) {
         try {
-            // 经由 DatabaseManager 调度到服务端主线程执行（世界访问只允许主线程）
-            SqlExecutor.QueryResult result = dbManager.executeSql(sql);
+            // 经由 DatabaseManager 调度到服务端主线程执行（世界访问只允许主线程），
+            // session 让 BEGIN/COMMIT/ROLLBACK 按连接隔离
+            SqlExecutor.QueryResult result = dbManager.executeSql(session, sql);
 
             if (result.isSuccess()) {
                 writer.println(result.getMessage());

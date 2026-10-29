@@ -112,6 +112,15 @@ public class HttpApiServer {
 
     // === 路由处理器 ===
 
+    /**
+     * 会话 ID：客户端可用 X-MinecraftDB-Session 头在多个请求间维持同一事务；
+     * 未提供时每个请求独立（自动生成一次性会话，等效自动提交）。
+     */
+    private String sessionId(HttpExchange exchange) {
+        String s = exchange.getRequestHeaders().getFirst("X-MinecraftDB-Session");
+        return "http:" + (s != null && !s.isEmpty() ? s : UUID.randomUUID());
+    }
+
     private class QueryHandler extends BaseHandler {
         @Override
         protected void handleRequest(HttpExchange exchange) throws IOException {
@@ -138,7 +147,7 @@ public class HttpApiServer {
                             "error", "GET /query 仅允许只读语句（SELECT/SHOW/DESC），写操作请使用 POST /execute"));
                     return;
                 }
-                SqlExecutor.QueryResult result = dbManager.executeSql(decoded);
+                SqlExecutor.QueryResult result = dbManager.executeSql(sessionId(exchange), decoded);
                 sendJson(exchange, 200, resultToMap(result));
             } catch (Exception e) {
                 sendJson(exchange, 400, Map.of("error", "Query failed", "message", e.getMessage()));
@@ -174,7 +183,7 @@ public class HttpApiServer {
             }
 
             try {
-                SqlExecutor.QueryResult result = dbManager.executeSql(sql);
+                SqlExecutor.QueryResult result = dbManager.executeSql(sessionId(exchange), sql);
                 sendJson(exchange, 200, resultToMap(result));
             } catch (Exception e) {
                 sendJson(exchange, 400, Map.of("error", "Execute failed", "message", e.getMessage()));
