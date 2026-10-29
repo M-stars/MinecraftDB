@@ -11,12 +11,18 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.List;
+import java.util.concurrent.Semaphore;
 
 /**
  * TCP CLI 服务器 — 通过 telnet 连接直接输入 SQL。
  * 默认仅绑定 127.0.0.1；配置 TCP_CLI_TOKEN 后连接需先输入 auth <token> 才能执行 SQL。
+ * 连接数上限 10、空闲超时 10 分钟、单行输入上限 64KB，防止恶意客户端耗尽资源。
  */
 public class TcpCliServer {
+
+    private static final int MAX_CONNECTIONS = 10;
+    private static final int MAX_LINE_LENGTH = 64 * 1024;
+    private static final int IDLE_TIMEOUT_MILLIS = 10 * 60 * 1000;
 
     private final String bindAddress;
     private final int port;
@@ -24,6 +30,7 @@ public class TcpCliServer {
     private ServerSocket serverSocket;
     private Thread listenerThread;
     private volatile boolean running;
+    private final Semaphore connectionSlots = new Semaphore(MAX_CONNECTIONS);
 
     public TcpCliServer(String bindAddress, int port, DatabaseManager dbManager) {
         this.bindAddress = bindAddress;
@@ -40,7 +47,22 @@ public class TcpCliServer {
             while (running) {
                 try {
                     Socket client = serverSocket.accept();
-                    Thread clientThread = new Thread(() -> handleClient(client));
+                    if (!connectionSlots.tryAcquire()) {
+                        try {
+                            client.getOutputStream().write(
+                                    ("已达最大连接数上限（" + MAX_CONNECTIONS + "），连接关闭\n")
+                                            .getBytes(StandardCharsets.UTF_8));
+                        } catch (IOException ignored) {}
+                        try { client.close(); } catch (IOException ignored) {}
+                        continue;
+                    }
+                    Thread clientThread = new Thread(() -> {
+                        try {
+                            handleClient(client);
+                        } finally {
+                            connectionSlots.release();
+                        }
+                    });
                     clientThread.setDaemon(true);
                     clientThread.setName("MinecraftDB-CLI-" + client.getInetAddress());
                     clientThread.start();
@@ -72,6 +94,7 @@ public class TcpCliServer {
             BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
             PrintWriter writer = new PrintWriter(new OutputStreamWriter(os, StandardCharsets.UTF_8), true)
         ) {
+            client.setSoTimeout(IDLE_TIMEOUT_MILLIS); // 空闲超时：read 抛 SocketTimeoutException 断开
             String dbName = dbManager.getDatabaseName();
             writer.println("");
             writer.println("╔══════════════════════════════════════════╗");
@@ -91,7 +114,7 @@ public class TcpCliServer {
                 writer.print("db > ");
                 writer.flush();
 
-                String line = reader.readLine();
+                String line = readLineLimited(reader, MAX_LINE_LENGTH);
                 if (line == null) break;
 
                 String trimmed = line.trim();
@@ -127,6 +150,24 @@ public class TcpCliServer {
     }
 
     /**
+     * 限长逐字符读一行：防止无限长输入耗尽内存（BufferedReader.readLine 无上限）。
+     * 返回 null 表示连接关闭（EOF）。
+     */
+    private String readLineLimited(BufferedReader reader, int maxLen) throws IOException {
+        StringBuilder sb = new StringBuilder(64);
+        int c;
+        while ((c = reader.read()) != -1) {
+            if (c == '\n') return sb.toString();
+            if (c == '\r') continue;
+            sb.append((char) c);
+            if (sb.length() > maxLen) {
+                throw new IOException("输入超过最大长度限制 " + maxLen);
+            }
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
+    /**
      * 配置了 token 时，连接后必须先输入 auth <token>，最多尝试 3 次。
      */
     private boolean authenticate(BufferedReader reader, PrintWriter writer) throws IOException {
@@ -137,7 +178,7 @@ public class TcpCliServer {
         for (int attempt = 0; attempt < 3; attempt++) {
             writer.print("auth > ");
             writer.flush();
-            String line = reader.readLine();
+            String line = readLineLimited(reader, MAX_LINE_LENGTH);
             if (line == null) return false;
 
             String trimmed = line.trim();

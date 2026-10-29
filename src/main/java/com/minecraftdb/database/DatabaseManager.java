@@ -163,7 +163,7 @@ public class DatabaseManager {
             if (cause instanceof Error error) throw error;
             throw new RuntimeException(cause);
         } catch (TimeoutException e) {
-            throw new RuntimeException("数据库任务在主线程排队超时（服务器可能正在关闭或卡顿）");
+            throw new RuntimeException("数据库任务在主线程排队超时（任务可能仍会执行，写入结果未知）");
         }
     }
 

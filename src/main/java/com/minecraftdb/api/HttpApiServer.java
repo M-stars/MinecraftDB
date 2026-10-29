@@ -15,6 +15,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.Executors;
 
@@ -78,19 +79,31 @@ public class HttpApiServer {
                     return;
                 }
 
-                // 认证检查
+                // 认证检查（常量时间比较，防时序侧信道）
                 String token = ModConfig.HTTP_API_TOKEN;
                 if (token != null && !token.isEmpty()) {
                     String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
-                    if (authHeader == null || !authHeader.equals("Bearer " + token)) {
+                    String expected = "Bearer " + token;
+                    boolean authorized = authHeader != null && MessageDigest.isEqual(
+                            authHeader.getBytes(StandardCharsets.UTF_8),
+                            expected.getBytes(StandardCharsets.UTF_8));
+                    if (!authorized) {
                         sendJson(exchange, 401, Map.of("error", "Unauthorized"));
                         return;
                     }
                 }
 
                 handleRequest(exchange);
+            } catch (PayloadTooLargeException e) {
+                try {
+                    sendJson(exchange, 413, Map.of("error", "Request body too large (max 1MB)"));
+                } catch (IOException ignored) {}
             } catch (Exception e) {
-                sendJson(exchange, 500, Map.of("error", "Internal Server Error", "message", e.getMessage()));
+                try {
+                    sendJson(exchange, 500, Map.of("error", "Internal Server Error", "message", e.getMessage()));
+                } catch (IOException ignored) {}
+            } finally {
+                exchange.close();
             }
         }
 
@@ -118,6 +131,13 @@ public class HttpApiServer {
 
             try {
                 String decoded = URLDecoder.decode(sql, StandardCharsets.UTF_8);
+                // GET 语义只读：写操作必须走 POST /execute，避免被预取/爬虫误触发
+                String head = decoded.trim().toUpperCase(Locale.ROOT);
+                if (!(head.startsWith("SELECT") || head.startsWith("SHOW") || head.startsWith("DESC"))) {
+                    sendJson(exchange, 405, Map.of(
+                            "error", "GET /query 仅允许只读语句（SELECT/SHOW/DESC），写操作请使用 POST /execute"));
+                    return;
+                }
                 SqlExecutor.QueryResult result = dbManager.executeSql(decoded);
                 sendJson(exchange, 200, resultToMap(result));
             } catch (Exception e) {
@@ -332,10 +352,26 @@ public class HttpApiServer {
     }
 
     private String readBody(HttpExchange exchange) throws IOException {
+        String lenHeader = exchange.getRequestHeaders().getFirst("Content-Length");
+        if (lenHeader != null) {
+            try {
+                if (Long.parseLong(lenHeader.trim()) > MAX_BODY_BYTES) {
+                    throw new PayloadTooLargeException();
+                }
+            } catch (NumberFormatException ignored) {}
+        }
         try (InputStream is = exchange.getRequestBody()) {
-            return new String(is.readAllBytes(), StandardCharsets.UTF_8);
+            byte[] bytes = is.readNBytes(MAX_BODY_BYTES + 1);
+            if (bytes.length > MAX_BODY_BYTES) {
+                throw new PayloadTooLargeException();
+            }
+            return new String(bytes, StandardCharsets.UTF_8);
         }
     }
+
+    private static final int MAX_BODY_BYTES = 1024 * 1024;
+
+    private static class PayloadTooLargeException extends RuntimeException {}
 
     private int parseInt(Map<String, String> params, String key, int defaultVal) {
         try {
