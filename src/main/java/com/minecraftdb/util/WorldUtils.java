@@ -76,7 +76,8 @@ public final class WorldUtils {
 
     public static void setWool(ServerLevel level, BlockPos pos, DyeColor color) {
         BlockState state = woolState(color);
-        level.setBlock(pos, state, 3);
+        // flag 2 = 同步客户端但跳过邻居形状更新：羊毛数据块不受邻居影响，省掉 6 方向更新开销
+        level.setBlock(pos, state, 2);
     }
 
     public static void setAir(ServerLevel level, BlockPos pos) {
