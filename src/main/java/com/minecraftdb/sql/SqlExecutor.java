@@ -49,31 +49,47 @@ public class SqlExecutor {
     private QueryResult executeCreateTable(CreateTableStatement stmt) {
         TableManager tableManager = dbManager.getTableManager();
         SchemaManager schemaManager = dbManager.getSchemaManager();
+        TransactionManager txnManager = dbManager.getTransactionManager();
 
         if (tableManager.tableExists(stmt.tableName)) {
             return QueryResult.error("Table '" + stmt.tableName + "' already exists");
         }
 
-        tableManager.createTable(stmt.tableName, stmt.columns);
-        schemaManager.saveSchema(stmt.tableName, stmt.columns);
+        // DDL 不在事务内（与非事务性 DDL 的常规语义一致），锁在方法内自持
+        boolean inTxn = txnManager.isInTransaction();
+        txnManager.acquireTableWriteLock(stmt.tableName);
+        try {
+            tableManager.createTable(stmt.tableName, stmt.columns);
+            schemaManager.saveSchema(stmt.tableName, stmt.columns);
+        } finally {
+            if (!inTxn) txnManager.releaseTableWriteLock(stmt.tableName);
+        }
         return QueryResult.ok("Table '" + stmt.tableName + "' created with " + stmt.columns.size() + " column(s)");
     }
 
     private QueryResult executeDropTable(DropTableStatement stmt) {
         TableManager tableManager = dbManager.getTableManager();
+        TransactionManager txnManager = dbManager.getTransactionManager();
 
         if (!tableManager.tableExists(stmt.tableName)) {
             return QueryResult.error("Table '" + stmt.tableName + "' does not exist");
         }
 
-        tableManager.dropTable(stmt.tableName);
-        dbManager.getSchemaManager().removeSchema(stmt.tableName);
+        boolean inTxn = txnManager.isInTransaction();
+        txnManager.acquireTableWriteLock(stmt.tableName);
+        try {
+            tableManager.dropTable(stmt.tableName);
+            dbManager.getSchemaManager().removeSchema(stmt.tableName);
+        } finally {
+            if (!inTxn) txnManager.releaseTableWriteLock(stmt.tableName);
+        }
         return QueryResult.ok("Table '" + stmt.tableName + "' dropped");
     }
 
     private QueryResult executeAlterTable(AlterTableStatement stmt) {
         TableManager tableManager = dbManager.getTableManager();
         SchemaManager schemaManager = dbManager.getSchemaManager();
+        TransactionManager txnManager = dbManager.getTransactionManager();
 
         if (!tableManager.tableExists(stmt.tableName)) {
             return QueryResult.error("Table '" + stmt.tableName + "' does not exist");
@@ -84,20 +100,26 @@ public class SqlExecutor {
             return QueryResult.error("Schema not found for table '" + stmt.tableName + "'");
         }
 
-        if ("ADD".equals(stmt.action)) {
-            schema.add(stmt.column);
-            schemaManager.saveSchema(stmt.tableName, schema);
-            return QueryResult.ok("Column '" + stmt.column.name + "' added to table '" + stmt.tableName + "'");
-        } else if ("DROP".equals(stmt.action)) {
-            boolean removed = schema.removeIf(c -> c.name.equalsIgnoreCase(stmt.dropColumnName));
-            if (!removed) {
-                return QueryResult.error("Column '" + stmt.dropColumnName + "' not found in table '" + stmt.tableName + "'");
+        boolean inTxn = txnManager.isInTransaction();
+        txnManager.acquireTableWriteLock(stmt.tableName);
+        try {
+            if ("ADD".equals(stmt.action)) {
+                schema.add(stmt.column);
+                schemaManager.saveSchema(stmt.tableName, schema);
+                return QueryResult.ok("Column '" + stmt.column.name + "' added to table '" + stmt.tableName + "'");
+            } else if ("DROP".equals(stmt.action)) {
+                boolean removed = schema.removeIf(c -> c.name.equalsIgnoreCase(stmt.dropColumnName));
+                if (!removed) {
+                    return QueryResult.error("Column '" + stmt.dropColumnName + "' not found in table '" + stmt.tableName + "'");
+                }
+                schemaManager.saveSchema(stmt.tableName, schema);
+                return QueryResult.ok("Column '" + stmt.dropColumnName + "' dropped from table '" + stmt.tableName + "'");
             }
-            schemaManager.saveSchema(stmt.tableName, schema);
-            return QueryResult.ok("Column '" + stmt.dropColumnName + "' dropped from table '" + stmt.tableName + "'");
-        }
 
-        return QueryResult.error("Unknown ALTER action: " + stmt.action);
+            return QueryResult.error("Unknown ALTER action: " + stmt.action);
+        } finally {
+            if (!inTxn) txnManager.releaseTableWriteLock(stmt.tableName);
+        }
     }
 
     private QueryResult executeInsert(InsertStatement stmt) {
@@ -144,6 +166,10 @@ public class SqlExecutor {
                 }
 
                 Object parsedValue = parseValue(rawValue, colDef.dataType);
+                if (parsedValue == null && !colDef.isNullable()) {
+                    return QueryResult.error("Column '" + colDef.name
+                            + "' cannot be NULL (NOT NULL constraint)");
+                }
                 rowData.put(colName, parsedValue);
             }
             allRowData.add(rowData);
@@ -154,6 +180,8 @@ public class SqlExecutor {
         if (autoCommit) {
             txnManager.begin();
         }
+        // 写锁由 commit/rollback 统一释放（acquire 时已登记进事务）
+        txnManager.acquireTableWriteLock(stmt.tableName);
 
         try {
             for (Map<String, Object> rowData : allRowData) {
@@ -323,6 +351,7 @@ public class SqlExecutor {
 
         boolean autoCommit = !txnManager.isInTransaction();
         if (autoCommit) txnManager.begin();
+        txnManager.acquireTableWriteLock(stmt.tableName);
 
         int updated = 0;
         try {
@@ -378,6 +407,7 @@ public class SqlExecutor {
 
         boolean autoCommit = !txnManager.isInTransaction();
         if (autoCommit) txnManager.begin();
+        txnManager.acquireTableWriteLock(stmt.tableName);
 
         int deleted = 0;
         try {
@@ -502,16 +532,28 @@ public class SqlExecutor {
 
         return switch (typeBase) {
             case "INT", "INTEGER" -> {
-                try { yield Integer.parseInt(raw); } catch (NumberFormatException e) { yield 0; }
+                try { yield Integer.parseInt(raw); }
+                catch (NumberFormatException e) {
+                    throw new SqlParser.ParseException("Invalid " + typeBase + " value: '" + raw + "'");
+                }
             }
             case "BIGINT" -> {
-                try { yield Long.parseLong(raw); } catch (NumberFormatException e) { yield 0L; }
+                try { yield Long.parseLong(raw); }
+                catch (NumberFormatException e) {
+                    throw new SqlParser.ParseException("Invalid " + typeBase + " value: '" + raw + "'");
+                }
             }
             case "FLOAT" -> {
-                try { yield Float.parseFloat(raw); } catch (NumberFormatException e) { yield 0.0f; }
+                try { yield Float.parseFloat(raw); }
+                catch (NumberFormatException e) {
+                    throw new SqlParser.ParseException("Invalid " + typeBase + " value: '" + raw + "'");
+                }
             }
             case "DOUBLE" -> {
-                try { yield Double.parseDouble(raw); } catch (NumberFormatException e) { yield 0.0; }
+                try { yield Double.parseDouble(raw); }
+                catch (NumberFormatException e) {
+                    throw new SqlParser.ParseException("Invalid " + typeBase + " value: '" + raw + "'");
+                }
             }
             case "BOOLEAN", "BOOL" -> "true".equalsIgnoreCase(raw) || "1".equals(raw);
             case "VARCHAR", "TEXT", "STRING" -> stripQuotes(raw);

@@ -24,10 +24,10 @@ public class TableManager {
     private final DatabaseManager dbManager;
 
     public TableManager(ServerLevel level, CoordinateAllocator coordAllocator, DatabaseManager dbManager,
-                        TransactionManager txnManager) {
+                        TransactionManager txnManager, boolean batchBlockUpdates) {
         this.level = level;
         this.coordAllocator = coordAllocator;
-        this.blockOp = new BlockOperator(level, txnManager);
+        this.blockOp = new BlockOperator(level, txnManager, batchBlockUpdates);
         this.dbManager = dbManager;
     }
 

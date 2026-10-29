@@ -22,10 +22,10 @@ public class BlockOperator {
     private final TransactionManager txnManager;
     private final Queue<PendingBlock> pendingQueue = new ConcurrentLinkedQueue<>();
 
-    public BlockOperator(ServerLevel level, TransactionManager txnManager) {
+    public BlockOperator(ServerLevel level, TransactionManager txnManager, boolean batchMode) {
         this.level = level;
         this.txnManager = txnManager;
-        this.batchMode = true;
+        this.batchMode = batchMode;
     }
 
     public ServerLevel getLevel() {

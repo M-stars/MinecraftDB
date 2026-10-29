@@ -51,7 +51,8 @@ public class DatabaseManager {
         // 方块写入路径依赖它记录 WAL）
         this.coordAllocator = new CoordinateAllocator();
         this.transactionManager = new TransactionManager(databaseLevel);
-        this.tableManager = new TableManager(databaseLevel, coordAllocator, this, transactionManager);
+        this.tableManager = new TableManager(databaseLevel, coordAllocator, this, transactionManager,
+                ModConfig.PERFORMANCE_BATCH_BLOCK_UPDATES);
         this.schemaManager = new SchemaManager(databaseLevel, coordAllocator);
         this.sqlExecutor = new SqlExecutor(this);
 
