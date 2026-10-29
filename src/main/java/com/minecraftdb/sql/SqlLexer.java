@@ -181,6 +181,7 @@ public class SqlLexer {
         SHOW, TABLES, DESC, INDEX, INDEXES, ON,
         ORDER, BY, LIMIT, OFFSET, ASC,
         IN, IS, LIKE,
+        IF, EXISTS, DEFAULT, AUTO_INCREMENT,
         VARCHAR, INT, BIGINT, TEXT, BOOLEAN, FLOAT, DOUBLE, DATE, DATETIME,
 
         // Identifiers and literals
@@ -244,6 +245,10 @@ public class SqlLexer {
             MAP.put("in", TokenType.IN);
             MAP.put("is", TokenType.IS);
             MAP.put("like", TokenType.LIKE);
+            MAP.put("if", TokenType.IF);
+            MAP.put("exists", TokenType.EXISTS);
+            MAP.put("default", TokenType.DEFAULT);
+            MAP.put("auto_increment", TokenType.AUTO_INCREMENT);
             MAP.put("desc", TokenType.DESC);
             MAP.put("varchar", TokenType.VARCHAR);
             MAP.put("int", TokenType.INT);

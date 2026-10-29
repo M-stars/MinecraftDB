@@ -227,6 +227,13 @@ public class SqlParser {
 
     private CreateTableStatement parseCreateTable() {
         expect(TokenType.TABLE);
+        boolean ifNotExists = false;
+        if (peek().type() == TokenType.IF) {
+            advance();
+            expect(TokenType.NOT);
+            expect(TokenType.EXISTS);
+            ifNotExists = true;
+        }
         String tableName = parseIdentifier();
         expect(TokenType.LPAREN);
 
@@ -253,7 +260,9 @@ public class SqlParser {
         expect(TokenType.RPAREN);
         expectOptional(TokenType.SEMICOLON);
 
-        return new CreateTableStatement(tableName, columns);
+        CreateTableStatement stmt = new CreateTableStatement(tableName, columns);
+        stmt.ifNotExists = ifNotExists;
+        return stmt;
     }
 
     private CreateIndexStatement parseCreateIndex() {
@@ -274,9 +283,15 @@ public class SqlParser {
     private Statement parseDrop() {
         expect(TokenType.DROP);
         expect(TokenType.TABLE);
+        boolean ifExists = false;
+        if (peek().type() == TokenType.IF) {
+            advance();
+            expect(TokenType.EXISTS);
+            ifExists = true;
+        }
         String tableName = parseIdentifier();
         expectOptional(TokenType.SEMICOLON);
-        return new DropTableStatement(tableName);
+        return new DropTableStatement(tableName, ifExists);
     }
 
     // === ALTER ===
@@ -454,6 +469,12 @@ public class SqlParser {
             } else if (peek().type() == TokenType.NULL_KW) {
                 advance();
                 cd.addConstraint("NULL");
+            } else if (peek().type() == TokenType.AUTO_INCREMENT) {
+                advance();
+                cd.setAutoIncrement(true);
+            } else if (peek().type() == TokenType.DEFAULT) {
+                advance();
+                cd.setDefaultValue(parseValue());
             } else {
                 break;
             }

@@ -66,7 +66,15 @@ public class SqlExecutor {
         TransactionManager txnManager = dbManager.getTransactionManager();
 
         if (tableManager.tableExists(stmt.tableName)) {
+            if (stmt.ifNotExists) {
+                return QueryResult.ok("Table '" + stmt.tableName + "' already exists, skipped (IF NOT EXISTS)");
+            }
             return QueryResult.error("Table '" + stmt.tableName + "' already exists");
+        }
+
+        long pkCount = stmt.columns.stream().filter(ColumnDefinition::isPrimaryKey).count();
+        if (pkCount > 1) {
+            return QueryResult.error("Only a single PRIMARY KEY column is supported");
         }
 
         // DDL 不在事务内（与非事务性 DDL 的常规语义一致），锁在方法内自持
@@ -86,6 +94,9 @@ public class SqlExecutor {
         TransactionManager txnManager = dbManager.getTransactionManager();
 
         if (!tableManager.tableExists(stmt.tableName)) {
+            if (stmt.ifExists) {
+                return QueryResult.ok("Table '" + stmt.tableName + "' does not exist, skipped (IF EXISTS)");
+            }
             return QueryResult.error("Table '" + stmt.tableName + "' does not exist");
         }
 
@@ -161,32 +172,19 @@ public class SqlExecutor {
             targetColumns = stmt.columns;
         }
 
-        // 逐组构建行数据（先全部校验，任何一组有问题都整体失败，不写入半截数据）
-        List<Map<String, Object>> allRowData = new ArrayList<>();
+        // 先校验列数与列名；行数据在事务内逐组构建——
+        // 自增值与唯一性检查依赖前面组已写入的数据
         for (List<String> valueGroup : stmt.valueRows) {
             if (targetColumns.size() != valueGroup.size()) {
                 return QueryResult.error("Column count (" + targetColumns.size()
                         + ") does not match value count (" + valueGroup.size() + ")");
             }
-
-            Map<String, Object> rowData = new LinkedHashMap<>();
             for (int i = 0; i < targetColumns.size(); i++) {
-                String colName = targetColumns.get(i);
-                String rawValue = valueGroup.get(i);
-
-                ColumnDefinition colDef = findColumn(schema, colName);
-                if (colDef == null) {
-                    return QueryResult.error("Column '" + colName + "' not found in table '" + stmt.tableName + "'");
+                if (findColumn(schema, targetColumns.get(i)) == null) {
+                    return QueryResult.error("Column '" + targetColumns.get(i)
+                            + "' not found in table '" + stmt.tableName + "'");
                 }
-
-                Object parsedValue = parseValue(rawValue, colDef.dataType);
-                if (parsedValue == null && !colDef.isNullable()) {
-                    return QueryResult.error("Column '" + colDef.name
-                            + "' cannot be NULL (NOT NULL constraint)");
-                }
-                rowData.put(colName, parsedValue);
             }
-            allRowData.add(rowData);
         }
 
         // Auto-commit mode: wrap in transaction
@@ -198,12 +196,51 @@ public class SqlExecutor {
         txnManager.acquireTableWriteLock(stmt.tableName);
 
         try {
-            for (Map<String, Object> rowData : allRowData) {
+            int inserted = 0;
+            for (List<String> valueGroup : stmt.valueRows) {
+                Map<String, Object> rowData = new LinkedHashMap<>();
+                for (int i = 0; i < targetColumns.size(); i++) {
+                    String colName = targetColumns.get(i);
+                    ColumnDefinition colDef = findColumn(schema, colName);
+                    Object parsedValue = parseValue(valueGroup.get(i), colDef.dataType);
+                    if (parsedValue != null && (colDef.isPrimaryKey() || colDef.autoIncrement)) {
+                        Long dup = findDuplicateZ(stmt.tableName, schema, colDef, parsedValue, -1);
+                        if (dup != null) {
+                            throw new IllegalStateException("Duplicate value '" + parsedValue
+                                    + "' for " + (colDef.isPrimaryKey() ? "PRIMARY KEY" : "AUTO_INCREMENT")
+                                    + " column '" + colDef.name + "' (existing row at z=" + dup + ")");
+                        }
+                    }
+                    rowData.put(colName, parsedValue);
+                }
+
+                // 补齐未提供的列：自增 > DEFAULT > NULL
+                for (ColumnDefinition colDef : schema) {
+                    if (rowData.containsKey(colDef.name)) continue;
+                    if (colDef.autoIncrement) {
+                        rowData.put(colDef.name, nextAutoValue(stmt.tableName, schema, colDef));
+                    } else if (colDef.defaultValue != null) {
+                        rowData.put(colDef.name, parseValue(colDef.defaultValue, colDef.dataType));
+                    } else {
+                        rowData.put(colDef.name, null);
+                    }
+                }
+
+                // NOT NULL / PRIMARY KEY 非空校验
+                for (ColumnDefinition colDef : schema) {
+                    if (rowData.get(colDef.name) == null && !colDef.isNullable() && !colDef.isPrimaryKey()) {
+                        throw new IllegalStateException("Column '" + colDef.name
+                                + "' cannot be NULL (NOT NULL constraint)");
+                    }
+                }
+
                 tableManager.insertRow(stmt.tableName, schema, rowData);
+                inserted++;
             }
             if (autoCommit) {
                 txnManager.commit();
             }
+            return QueryResult.ok(inserted + " row(s) inserted into '" + stmt.tableName + "'");
         } catch (Exception e) {
             if (autoCommit) {
                 txnManager.rollback();
@@ -211,8 +248,46 @@ public class SqlExecutor {
             tableManager.getBlockOperator().clearPending();
             return QueryResult.error("Insert failed: " + e.getMessage());
         }
+    }
 
-        return QueryResult.ok(allRowData.size() + " row(s) inserted into '" + stmt.tableName + "'");
+    /** 自增列取现有最大值 +1（扫描该列全部行） */
+    private long nextAutoValue(String tableName, List<ColumnDefinition> schema, ColumnDefinition col) {
+        TableManager tm = dbManager.getTableManager();
+        long max = 0;
+        long maxZ = tm.getMaxZ(tableName);
+        for (int z = 1; z < maxZ; z++) {
+            Map<String, Object> row = tm.readRow(tableName, schema, z);
+            if (row == null || row.isEmpty()) continue;
+            Object v = row.get(col.name);
+            if (v instanceof Number n && n.longValue() > max) {
+                max = n.longValue();
+            }
+        }
+        return max + 1;
+    }
+
+    /** 在表中查找与 value 相等的行（唯一性检查）；excludeZ 用于 UPDATE 排除本行 */
+    private Long findDuplicateZ(String tableName, List<ColumnDefinition> schema, ColumnDefinition col,
+                                Object value, long excludeZ) {
+        TableManager tm = dbManager.getTableManager();
+        long maxZ = tm.getMaxZ(tableName);
+        for (int z = 1; z < maxZ; z++) {
+            if (z == excludeZ) continue;
+            Map<String, Object> row = tm.readRow(tableName, schema, z);
+            if (row == null || row.isEmpty()) continue;
+            if (valueEquals(value, row.get(col.name))) {
+                return (long) z;
+            }
+        }
+        return null;
+    }
+
+    private static boolean valueEquals(Object a, Object b) {
+        if (a == null || b == null) return a == b;
+        if (a instanceof Number na && b instanceof Number nb) {
+            return na.doubleValue() == nb.doubleValue();
+        }
+        return a.equals(b);
     }
 
     private QueryResult executeSelect(SelectStatement stmt) {
@@ -384,6 +459,22 @@ public class SqlExecutor {
                 }
 
                 if (matches) {
+                    // 主键/自增列被 SET 时检查唯一性（排除本行）
+                    for (ColumnDefinition cd : schema) {
+                        if ((cd.isPrimaryKey() || cd.autoIncrement) && parsedAssignments.containsKey(cd.name)) {
+                            Object v = parsedAssignments.get(cd.name);
+                            if (v == null) {
+                                throw new IllegalStateException("Column '" + cd.name
+                                        + "' cannot be set to NULL (" + (cd.isPrimaryKey() ? "PRIMARY KEY" : "AUTO_INCREMENT") + ")");
+                            }
+                            Long dup = findDuplicateZ(stmt.tableName, schema, cd, v, z);
+                            if (dup != null) {
+                                throw new IllegalStateException("Duplicate value '" + v
+                                        + "' for " + (cd.isPrimaryKey() ? "PRIMARY KEY" : "AUTO_INCREMENT")
+                                        + " column '" + cd.name + "' (existing row at z=" + dup + ")");
+                            }
+                        }
+                    }
                     tableManager.updateRow(stmt.tableName, schema, z, parsedAssignments);
                     updated++;
                 }
@@ -478,14 +569,16 @@ public class SqlExecutor {
             return QueryResult.error("Table '" + stmt.tableName + "' does not exist");
         }
 
-        List<String> cols = List.of("Field", "Type", "Null", "Key");
+        List<String> cols = List.of("Field", "Type", "Null", "Key", "Default", "Extra");
         List<List<Object>> rows = new ArrayList<>();
         for (ColumnDefinition cd : schema) {
             rows.add(List.of(
                     cd.name,
                     cd.dataType,
-                    cd.isNullable() ? "YES" : "NO",
-                    cd.isPrimaryKey() ? "PRI" : ""
+                    (cd.isNullable() && !cd.isPrimaryKey()) ? "YES" : "NO",
+                    cd.isPrimaryKey() ? "PRI" : "",
+                    cd.defaultValue != null ? stripQuotes(cd.defaultValue) : "NULL",
+                    cd.autoIncrement ? "auto_increment" : ""
             ));
         }
 

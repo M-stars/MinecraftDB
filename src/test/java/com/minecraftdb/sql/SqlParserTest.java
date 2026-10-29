@@ -167,6 +167,34 @@ class SqlParserTest {
     }
 
     @Test
+    @DisplayName("解析 DEFAULT 与 AUTO_INCREMENT")
+    void parseColumnDefaults() {
+        CreateTableStatement stmt = (CreateTableStatement) parse(
+            "CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(50) DEFAULT 'anon', score INT DEFAULT 0)");
+        assertTrue(stmt.columns.get(0).autoIncrement);
+        assertEquals("'anon'", stmt.columns.get(1).defaultValue);
+        assertEquals("0", stmt.columns.get(2).defaultValue);
+    }
+
+    @Test
+    @DisplayName("解析 IF NOT EXISTS / IF EXISTS")
+    void parseIdempotentDdl() {
+        CreateTableStatement create = (CreateTableStatement) parse(
+            "CREATE TABLE IF NOT EXISTS users (id INT)");
+        assertTrue(create.ifNotExists);
+
+        CreateTableStatement create2 = (CreateTableStatement) parse(
+            "CREATE TABLE users (id INT)");
+        assertFalse(create2.ifNotExists);
+
+        DropTableStatement drop = (DropTableStatement) parse("DROP TABLE IF EXISTS users");
+        assertTrue(drop.ifExists);
+
+        DropTableStatement drop2 = (DropTableStatement) parse("DROP TABLE users");
+        assertFalse(drop2.ifExists);
+    }
+
+    @Test
     @DisplayName("解析 DROP TABLE")
     void parseDropTable() {
         DropTableStatement stmt = (DropTableStatement) parse("DROP TABLE users");
