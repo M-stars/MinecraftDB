@@ -10,6 +10,15 @@ import static org.junit.jupiter.api.Assertions.*;
 class WhereClauseTest {
 
     @Test
+    @DisplayName("条件列名大小写不敏感")
+    void caseInsensitiveColumn() {
+        WhereClause wc = new WhereClause();
+        wc.addCondition(new WhereClause.Condition("NAME", "=", "'Alice'"));
+        assertTrue(wc.evaluate(List.of("id", "name", "age"), List.of(1, "Alice", 25)));
+        assertFalse(wc.evaluate(List.of("id", "name", "age"), List.of(1, "Bob", 25)));
+    }
+
+    @Test
     @DisplayName("等于条件匹配")
     void equalsMatch() {
         WhereClause wc = new WhereClause();

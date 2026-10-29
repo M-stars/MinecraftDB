@@ -7,6 +7,9 @@ public class WhereClause {
     public final List<Condition> conditions = new ArrayList<>();
     public final List<LogicalOp> logicalOps = new ArrayList<>();
 
+    /** 首次求值时把条件列名解析为列下标（大小写不敏感），之后每行 O(1) 定位 */
+    private int[] resolvedColumnIdx;
+
     public enum LogicalOp {
         AND, OR
     }
@@ -77,6 +80,10 @@ public class WhereClause {
     public boolean evaluate(List<String> columnNames, List<Object> rowValues) {
         if (conditions.isEmpty()) return true;
 
+        if (resolvedColumnIdx == null) {
+            resolveColumns(columnNames);
+        }
+
         boolean result = evaluateCondition(0, columnNames, rowValues);
         for (int i = 0; i < logicalOps.size(); i++) {
             boolean next = evaluateCondition(i + 1, columnNames, rowValues);
@@ -89,10 +96,26 @@ public class WhereClause {
         return result;
     }
 
+    private void resolveColumns(List<String> columnNames) {
+        resolvedColumnIdx = new int[conditions.size()];
+        for (int i = 0; i < conditions.size(); i++) {
+            resolvedColumnIdx[i] = indexOfIgnoreCase(columnNames, conditions.get(i).column);
+        }
+    }
+
+    private static int indexOfIgnoreCase(List<String> names, String target) {
+        for (int i = 0; i < names.size(); i++) {
+            if (names.get(i).equalsIgnoreCase(target)) return i;
+        }
+        return -1;
+    }
+
     private boolean evaluateCondition(int idx, List<String> columnNames, List<Object> rowValues) {
         if (idx >= conditions.size()) return true;
         Condition cond = conditions.get(idx);
-        int colIdx = columnNames.indexOf(cond.column);
+        int colIdx = resolvedColumnIdx != null
+                ? resolvedColumnIdx[idx]
+                : indexOfIgnoreCase(columnNames, cond.column);
         if (colIdx < 0 || colIdx >= rowValues.size()) return false;
         return cond.evaluate(rowValues.get(colIdx));
     }
