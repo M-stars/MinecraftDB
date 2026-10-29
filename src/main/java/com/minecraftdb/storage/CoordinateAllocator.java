@@ -38,7 +38,8 @@ public class CoordinateAllocator {
         }
 
         int width = Math.max(DEFAULT_TABLE_WIDTH, columnCount * 2);
-        TableCoords coords = new TableCoords(tableName, nextXStart, nextXStart + width - 1, 0);
+        // 行号从 1 开始：readAllRows 按 z=1..nextZ-1 读取，z=0 是表边界/元数据标记区
+        TableCoords coords = new TableCoords(tableName, nextXStart, nextXStart + width - 1, 1);
         tableCoords.put(tableName, coords);
         nextXStart += width + 10; // 10-block gap between tables
         coordCache.put(tableName, coords);
@@ -98,6 +99,7 @@ public class CoordinateAllocator {
     public synchronized void loadFromExisting(Map<String, TableCoords> existing) {
         tableCoords.putAll(existing);
         for (TableCoords tc : existing.values()) {
+            if (tc.nextZ < 1) tc.nextZ = 1; // 旧注册表 nextZ 可能为 0，行号必须从 1 起
             if (tc.xEnd >= nextXStart) {
                 nextXStart = tc.xEnd + 11;
             }
