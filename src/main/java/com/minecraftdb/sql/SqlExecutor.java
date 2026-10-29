@@ -124,23 +124,28 @@ public class SqlExecutor {
             targetColumns = stmt.columns;
         }
 
-        if (targetColumns.size() != stmt.values.size()) {
-            return QueryResult.error("Column count (" + targetColumns.size() + ") does not match value count (" + stmt.values.size() + ")");
-        }
-
-        // Build row data with type validation
-        Map<String, Object> rowData = new LinkedHashMap<>();
-        for (int i = 0; i < targetColumns.size(); i++) {
-            String colName = targetColumns.get(i);
-            String rawValue = stmt.values.get(i);
-
-            ColumnDefinition colDef = findColumn(schema, colName);
-            if (colDef == null) {
-                return QueryResult.error("Column '" + colName + "' not found in table '" + stmt.tableName + "'");
+        // 逐组构建行数据（先全部校验，任何一组有问题都整体失败，不写入半截数据）
+        List<Map<String, Object>> allRowData = new ArrayList<>();
+        for (List<String> valueGroup : stmt.valueRows) {
+            if (targetColumns.size() != valueGroup.size()) {
+                return QueryResult.error("Column count (" + targetColumns.size()
+                        + ") does not match value count (" + valueGroup.size() + ")");
             }
 
-            Object parsedValue = parseValue(rawValue, colDef.dataType);
-            rowData.put(colName, parsedValue);
+            Map<String, Object> rowData = new LinkedHashMap<>();
+            for (int i = 0; i < targetColumns.size(); i++) {
+                String colName = targetColumns.get(i);
+                String rawValue = valueGroup.get(i);
+
+                ColumnDefinition colDef = findColumn(schema, colName);
+                if (colDef == null) {
+                    return QueryResult.error("Column '" + colName + "' not found in table '" + stmt.tableName + "'");
+                }
+
+                Object parsedValue = parseValue(rawValue, colDef.dataType);
+                rowData.put(colName, parsedValue);
+            }
+            allRowData.add(rowData);
         }
 
         // Auto-commit mode: wrap in transaction
@@ -150,7 +155,9 @@ public class SqlExecutor {
         }
 
         try {
-            tableManager.insertRow(stmt.tableName, schema, rowData);
+            for (Map<String, Object> rowData : allRowData) {
+                tableManager.insertRow(stmt.tableName, schema, rowData);
+            }
             if (autoCommit) {
                 txnManager.commit();
             }
@@ -162,7 +169,7 @@ public class SqlExecutor {
             return QueryResult.error("Insert failed: " + e.getMessage());
         }
 
-        return QueryResult.ok("1 row inserted into '" + stmt.tableName + "'");
+        return QueryResult.ok(allRowData.size() + " row(s) inserted into '" + stmt.tableName + "'");
     }
 
     private QueryResult executeSelect(SelectStatement stmt) {
@@ -203,14 +210,38 @@ public class SqlExecutor {
             }
         }
 
+        // ORDER BY（列名统一为 schema 内的真实列名，找不到直接报错）
+        List<SelectStatement.OrderBy> resolvedOrderBy = new ArrayList<>();
+        for (SelectStatement.OrderBy ob : stmt.orderBy) {
+            ColumnDefinition cd = findColumn(schema, ob.column());
+            if (cd == null) {
+                return QueryResult.error("Unknown column '" + ob.column() + "' in ORDER BY");
+            }
+            resolvedOrderBy.add(new SelectStatement.OrderBy(cd.name, ob.ascending()));
+        }
+        if (!resolvedOrderBy.isEmpty()) {
+            filteredRows.sort((a, b) -> {
+                for (SelectStatement.OrderBy ob : resolvedOrderBy) {
+                    int cmp = compareValues(a.get(ob.column()), b.get(ob.column()));
+                    if (cmp != 0) return ob.ascending() ? cmp : -cmp;
+                }
+                return 0;
+            });
+        }
+
+        // LIMIT / OFFSET
+        int from = stmt.offset != null ? Math.min(stmt.offset, filteredRows.size()) : 0;
+        int to = stmt.limit != null ? Math.min(from + stmt.limit, filteredRows.size()) : filteredRows.size();
+        List<Map<String, Object>> pagedRows = filteredRows.subList(from, to);
+
         // Project columns
         List<String> selectColumns = stmt.isSelectAll() ? columnNames : stmt.columns;
 
-        QueryResult result = QueryResult.ok("Selected " + filteredRows.size() + " row(s)");
+        QueryResult result = QueryResult.ok("Selected " + pagedRows.size() + " row(s)");
         result.setColumns(selectColumns);
 
         List<List<Object>> rows = new ArrayList<>();
-        for (Map<String, Object> row : filteredRows) {
+        for (Map<String, Object> row : pagedRows) {
             List<Object> projected = new ArrayList<>();
             for (String col : selectColumns) {
                 projected.add(row.getOrDefault(col, null));
@@ -218,9 +249,20 @@ public class SqlExecutor {
             rows.add(projected);
         }
         result.setRows(rows);
-        result.setRowCount(filteredRows.size());
+        result.setRowCount(pagedRows.size());
 
         return result;
+    }
+
+    /** 排序比较：null 最小，数值按数值比较，其余按字符串比较 */
+    private int compareValues(Object a, Object b) {
+        if (a == null && b == null) return 0;
+        if (a == null) return -1;
+        if (b == null) return 1;
+        if (a instanceof Number na && b instanceof Number nb) {
+            return Double.compare(na.doubleValue(), nb.doubleValue());
+        }
+        return a.toString().compareTo(b.toString());
     }
 
     private QueryResult executeUpdate(UpdateStatement stmt) {

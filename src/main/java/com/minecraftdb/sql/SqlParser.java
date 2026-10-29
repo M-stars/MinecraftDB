@@ -68,8 +68,60 @@ public class SqlParser {
             whereClause = parseWhereClause();
         }
 
+        List<SelectStatement.OrderBy> orderBy = new ArrayList<>();
+        if (peek().type() == TokenType.ORDER) {
+            advance();
+            expect(TokenType.BY);
+            orderBy.add(parseOrderByItem());
+            while (peek().type() == TokenType.COMMA) {
+                advance();
+                orderBy.add(parseOrderByItem());
+            }
+        }
+
+        Integer limit = null;
+        Integer offset = null;
+        if (peek().type() == TokenType.LIMIT) {
+            advance();
+            limit = parseIntLiteral();
+            if (peek().type() == TokenType.COMMA) {
+                // MySQL 风格：LIMIT offset, count
+                advance();
+                offset = limit;
+                limit = parseIntLiteral();
+            } else if (peek().type() == TokenType.OFFSET) {
+                advance();
+                offset = parseIntLiteral();
+            }
+        }
+
         expectOptional(TokenType.SEMICOLON);
-        return new SelectStatement(columns, tableName, whereClause);
+        return new SelectStatement(columns, tableName, whereClause, orderBy, limit, offset);
+    }
+
+    private SelectStatement.OrderBy parseOrderByItem() {
+        String column = parseIdentifier();
+        boolean ascending = true;
+        if (peek().type() == TokenType.ASC) {
+            advance();
+        } else if (peek().type() == TokenType.DESC) {
+            ascending = false;
+            advance();
+        }
+        return new SelectStatement.OrderBy(column, ascending);
+    }
+
+    private int parseIntLiteral() {
+        Token t = peek();
+        if (t.type() == TokenType.NUMBER) {
+            advance();
+            try {
+                return Integer.parseInt(t.value());
+            } catch (NumberFormatException e) {
+                throw new ParseException("Invalid number: " + t.value());
+            }
+        }
+        throw new ParseException("Expected number, got: " + t.value());
     }
 
     // === INSERT ===
@@ -91,6 +143,19 @@ public class SqlParser {
         }
 
         expect(TokenType.VALUES);
+
+        List<List<String>> valueRows = new ArrayList<>();
+        valueRows.add(parseValueGroup());
+        while (peek().type() == TokenType.COMMA) {
+            advance();
+            valueRows.add(parseValueGroup());
+        }
+
+        expectOptional(TokenType.SEMICOLON);
+        return new InsertStatement(tableName, columns, valueRows);
+    }
+
+    private List<String> parseValueGroup() {
         expect(TokenType.LPAREN);
         List<String> values = new ArrayList<>();
         values.add(parseValue());
@@ -99,9 +164,7 @@ public class SqlParser {
             values.add(parseValue());
         }
         expect(TokenType.RPAREN);
-
-        expectOptional(TokenType.SEMICOLON);
-        return new InsertStatement(tableName, columns, values);
+        return values;
     }
 
     // === UPDATE ===

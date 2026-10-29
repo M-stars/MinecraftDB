@@ -66,10 +66,45 @@ class SqlParserTest {
             "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25)");
         assertEquals("users", stmt.tableName);
         assertEquals(List.of("id", "name", "age"), stmt.columns);
-        assertEquals(3, stmt.values.size());
-        assertEquals("1", stmt.values.get(0));
-        assertEquals("'Alice'", stmt.values.get(1));
-        assertEquals("25", stmt.values.get(2));
+        assertEquals(1, stmt.valueRows.size());
+        assertEquals(3, stmt.valueRows.get(0).size());
+        assertEquals("1", stmt.valueRows.get(0).get(0));
+        assertEquals("'Alice'", stmt.valueRows.get(0).get(1));
+        assertEquals("25", stmt.valueRows.get(0).get(2));
+    }
+
+    @Test
+    @DisplayName("解析 INSERT 多组 VALUES")
+    void parseInsertMultiValues() {
+        InsertStatement stmt = (InsertStatement) parse(
+            "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')");
+        assertEquals(3, stmt.valueRows.size());
+        assertEquals("1", stmt.valueRows.get(0).get(0));
+        assertEquals("'Bob'", stmt.valueRows.get(1).get(1));
+        assertEquals("'Carol'", stmt.valueRows.get(2).get(1));
+    }
+
+    @Test
+    @DisplayName("解析 SELECT with ORDER BY / LIMIT / OFFSET")
+    void parseSelectPaging() {
+        SelectStatement stmt = (SelectStatement) parse(
+            "SELECT * FROM users WHERE age > 18 ORDER BY age DESC, name ASC LIMIT 10 OFFSET 5");
+        assertNotNull(stmt.whereClause);
+        assertEquals(2, stmt.orderBy.size());
+        assertEquals("age", stmt.orderBy.get(0).column());
+        assertFalse(stmt.orderBy.get(0).ascending());
+        assertEquals("name", stmt.orderBy.get(1).column());
+        assertTrue(stmt.orderBy.get(1).ascending());
+        assertEquals(10, stmt.limit);
+        assertEquals(5, stmt.offset);
+    }
+
+    @Test
+    @DisplayName("解析 SELECT with LIMIT（MySQL 风格 offset,count）")
+    void parseSelectLimitComma() {
+        SelectStatement stmt = (SelectStatement) parse("SELECT * FROM users LIMIT 5, 10");
+        assertEquals(10, stmt.limit);
+        assertEquals(5, stmt.offset);
     }
 
     @Test

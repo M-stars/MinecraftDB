@@ -25,7 +25,7 @@ class SqlIntegrationTest {
         // INSERT
         InsertStatement insert = parse("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 25)");
         assertEquals("users", insert.tableName);
-        assertEquals("'Alice'", insert.values.get(1));
+        assertEquals("'Alice'", insert.valueRows.get(0).get(1));
 
         // SELECT
         SelectStatement select = parse("SELECT * FROM users WHERE age > 18");
@@ -95,7 +95,7 @@ class SqlIntegrationTest {
     @DisplayName("NULL 值插入解析")
     void insertNull() {
         InsertStatement stmt = parse("INSERT INTO users (id, name) VALUES (1, null)");
-        assertEquals("null", stmt.values.get(1));
+        assertEquals("null", stmt.valueRows.get(0).get(1));
     }
 
     @Test

@@ -179,6 +179,7 @@ public class SqlLexer {
         AND, OR, NOT, NULL_KW, PRIMARY, KEY,
         BEGIN, COMMIT, ROLLBACK,
         SHOW, TABLES, DESC, INDEX, INDEXES, ON,
+        ORDER, BY, LIMIT, OFFSET, ASC,
         VARCHAR, INT, BIGINT, TEXT, BOOLEAN, FLOAT, DOUBLE, DATE, DATETIME,
 
         // Identifiers and literals
@@ -234,6 +235,12 @@ public class SqlLexer {
             MAP.put("index", TokenType.INDEX);
             MAP.put("indexes", TokenType.INDEXES);
             MAP.put("on", TokenType.ON);
+            MAP.put("order", TokenType.ORDER);
+            MAP.put("by", TokenType.BY);
+            MAP.put("limit", TokenType.LIMIT);
+            MAP.put("offset", TokenType.OFFSET);
+            MAP.put("asc", TokenType.ASC);
+            MAP.put("desc", TokenType.DESC);
             MAP.put("varchar", TokenType.VARCHAR);
             MAP.put("int", TokenType.INT);
             MAP.put("integer", TokenType.INT);
