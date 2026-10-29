@@ -89,7 +89,12 @@ public class DatabaseManager {
     }
 
     private void ensureBedrockLayer() {
-        for (int x = 0; x < 200; x++) {
+        // X 范围必须覆盖所有已分配表（表坐标只增不减，200 是最小兜底）
+        int xBound = 200;
+        for (CoordinateAllocator.TableCoords tc : coordAllocator.getAllCoords().values()) {
+            xBound = Math.max(xBound, tc.xEnd + 1);
+        }
+        for (int x = 0; x < xBound; x++) {
             for (int z = 0; z < 200; z++) {
                 BlockPos pos = new BlockPos(x, WorldUtils.BEDROCK_Y, z);
                 if (databaseLevel.getBlockState(pos).isAir()) {
@@ -100,17 +105,21 @@ public class DatabaseManager {
     }
 
     /**
-     * 为已注册的每个表验证并放置基岩边界标记
+     * 为已注册的每个表验证并放置基岩边界标记（已就位的方块跳过，避免重复标脏 chunk）
      */
     private void verifyTableBoundaries() {
         for (CoordinateAllocator.TableCoords coords : coordAllocator.getAllCoords().values()) {
             for (int x = coords.xStart; x <= coords.xEnd; x++) {
                 BlockPos pos = new BlockPos(x, 0, 0);
-                databaseLevel.setBlock(pos, Blocks.BEDROCK.defaultBlockState(), 3);
+                if (!databaseLevel.getBlockState(pos).is(Blocks.BEDROCK)) {
+                    databaseLevel.setBlock(pos, Blocks.BEDROCK.defaultBlockState(), 3);
+                }
             }
             // 在 Y=255 放一个标记块（金块），方便在空中看到表范围
             BlockPos markerPos = new BlockPos(coords.xStart, 255, 0);
-            databaseLevel.setBlock(markerPos, Blocks.GOLD_BLOCK.defaultBlockState(), 3);
+            if (!databaseLevel.getBlockState(markerPos).is(Blocks.GOLD_BLOCK)) {
+                databaseLevel.setBlock(markerPos, Blocks.GOLD_BLOCK.defaultBlockState(), 3);
+            }
         }
     }
 
