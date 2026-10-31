@@ -2,12 +2,14 @@ package com.minecraftdb.sql;
 
 import com.minecraftdb.config.ModConfig;
 import com.minecraftdb.database.DatabaseManager;
+import com.minecraftdb.database.IndexManager;
 import com.minecraftdb.database.SchemaManager;
 import com.minecraftdb.database.TableManager;
 import com.minecraftdb.database.TransactionManager;
 import com.minecraftdb.sql.ast.*;
 
 import java.util.*;
+import java.util.stream.LongStream;
 
 public class SqlExecutor {
 
@@ -59,6 +61,7 @@ public class SqlExecutor {
             case ROLLBACK -> executeRollback();
             case CREATE_INDEX -> executeCreateIndex((CreateIndexStatement) stmt);
             case SHOW_INDEXES -> executeShowIndexes((ShowIndexesStatement) stmt);
+            case EXPLAIN -> executeExplain((ExplainStatement) stmt);
         };
     }
 
@@ -107,6 +110,8 @@ public class SqlExecutor {
         try {
             tableManager.dropTable(stmt.tableName);
             dbManager.getSchemaManager().removeSchema(stmt.tableName);
+            IndexManager idx = dbManager.getIndexManager();
+            if (idx != null) idx.dropTable(stmt.tableName);
         } finally {
             if (!inTxn) txnManager.releaseTableWriteLock(stmt.tableName);
         }
@@ -130,6 +135,8 @@ public class SqlExecutor {
         boolean inTxn = txnManager.isInTransaction();
         txnManager.acquireTableWriteLock(stmt.tableName);
         try {
+            IndexManager idx = dbManager.getIndexManager();
+            if (idx != null) idx.invalidateTable(stmt.tableName); // 列集合可能变化，索引失效待重建
             if ("ADD".equals(stmt.action)) {
                 schema.add(stmt.column);
                 schemaManager.saveSchema(stmt.tableName, schema);
@@ -172,6 +179,8 @@ public class SqlExecutor {
         txnManager.acquireTableWriteLock(stmt.tableName);
         try {
             tableManager.truncateTable(stmt.tableName, schema);
+            IndexManager idx = dbManager.getIndexManager();
+            if (idx != null) idx.invalidateTable(stmt.tableName);
         } finally {
             txnManager.releaseTableWriteLock(stmt.tableName);
         }
@@ -274,7 +283,9 @@ public class SqlExecutor {
                     }
                 }
 
-                tableManager.insertRow(stmt.tableName, schema, rowData);
+                long z = tableManager.insertRow(stmt.tableName, schema, rowData);
+                IndexManager idx = dbManager.getIndexManager();
+                if (idx != null) idx.onInsert(stmt.tableName, z, rowData);
                 inserted++;
             }
             if (autoCommit) {
@@ -306,10 +317,23 @@ public class SqlExecutor {
         return max + 1;
     }
 
-    /** 在表中查找与 value 相等的行（唯一性检查）；excludeZ 用于 UPDATE 排除本行 */
+    /** 在表中查找与 value 相等的行（唯一性检查）；excludeZ 用于 UPDATE 排除本行。
+     *  列可索引时走内存索引（候选集是超集，命中后仍逐行复核），否则回退全列扫描。 */
     private Long findDuplicateZ(String tableName, List<ColumnDefinition> schema, ColumnDefinition col,
                                 Object value, long excludeZ) {
         TableManager tm = dbManager.getTableManager();
+        IndexManager idx = dbManager.getIndexManager();
+        if (idx != null && idx.isIndexable(tableName, col.name)) {
+            for (long z : idx.lookup(tableName, col.name, value)) {
+                if (z == excludeZ) continue;
+                Map<String, Object> row = tm.readRow(tableName, schema, (int) z);
+                if (row == null || row.isEmpty()) continue;
+                if (valueEquals(value, row.get(col.name))) {
+                    return z;
+                }
+            }
+            return null;
+        }
         long maxZ = tm.getMaxZ(tableName);
         for (int z = 1; z < maxZ; z++) {
             if (z == excludeZ) continue;
@@ -404,12 +428,14 @@ public class SqlExecutor {
                 ? stmt.limit
                 : ModConfig.PERFORMANCE_MAX_SELECT_ROWS;
 
-        // 流式逐行扫描：WHERE 在读取阶段求值，避免全量物化
+        // 流式逐行扫描：WHERE 在读取阶段求值，避免全量物化。
+        // 查询计划：WHERE 含 col = 常量 且列可索引时走内存索引，否则全表扫描。
+        QueryPlanner.Plan plan = pickPlan(stmt.tableName, schema, stmt.whereClause);
         List<Map<String, Object>> collected = new ArrayList<>();
-        long maxZ = tableManager.getMaxZ(stmt.tableName);
         int matchedCount = 0;
         boolean capReached = false;
-        for (int z = 1; z < maxZ; z++) {
+        for (long zLong : rowSource(stmt.tableName, plan)) {
+            int z = (int) zLong;
             Map<String, Object> row = tableManager.readRow(stmt.tableName, schema, z);
             if (row == null || row.isEmpty()) continue;
 
@@ -625,6 +651,24 @@ public class SqlExecutor {
         return result;
     }
 
+    // === 查询计划 ===
+
+    /** 为语句挑查询计划：索引等值查找或全表扫描（IndexManager 不可用时一律全扫描） */
+    private QueryPlanner.Plan pickPlan(String tableName, List<ColumnDefinition> schema, WhereClause where) {
+        IndexManager idx = dbManager.getIndexManager();
+        if (idx == null) return new QueryPlanner.Plan(null, null, false);
+        return QueryPlanner.pickPlan(idx.indexableColumns(tableName), schema, where);
+    }
+
+    /** 计划对应的候选行号源：索引命中集合或 z=1..maxZ-1 全表 */
+    private Iterable<Long> rowSource(String tableName, QueryPlanner.Plan plan) {
+        if (plan.indexUsed()) {
+            return dbManager.getIndexManager().lookup(tableName, plan.column(), plan.key());
+        }
+        long maxZ = dbManager.getTableManager().getMaxZ(tableName);
+        return () -> LongStream.range(1, maxZ).iterator();
+    }
+
     private String resolveSchemaName(List<ColumnDefinition> schema, String col) {
         ColumnDefinition cd = findColumn(schema, col);
         return cd != null ? cd.name : col;
@@ -768,8 +812,9 @@ public class SqlExecutor {
 
         int updated = 0;
         try {
-            long maxZ = tableManager.getMaxZ(stmt.tableName);
-            for (int z = 1; z < maxZ; z++) {
+            QueryPlanner.Plan plan = pickPlan(stmt.tableName, schema, stmt.whereClause);
+            for (long zLong : rowSource(stmt.tableName, plan)) {
+                int z = (int) zLong;
                 Map<String, Object> row = tableManager.readRow(stmt.tableName, schema, z);
                 if (row == null || row.isEmpty()) continue;
 
@@ -809,6 +854,11 @@ public class SqlExecutor {
                         }
                         newValues.put(cd.name, v);
                     }
+                    // 索引维护：以「更新后的完整行」重登记值发生变化的可索引列
+                    Map<String, Object> merged = new LinkedHashMap<>(row);
+                    merged.putAll(newValues);
+                    IndexManager idx = dbManager.getIndexManager();
+                    if (idx != null) idx.onUpdate(stmt.tableName, z, row, merged);
                     tableManager.updateRow(stmt.tableName, schema, z, newValues);
                     updated++;
                 }
@@ -851,8 +901,9 @@ public class SqlExecutor {
         int deleted = 0;
         try {
             // 流式逐行判断并删除，全部完成后合并为一次批量 flush
-            long maxZ = tableManager.getMaxZ(stmt.tableName);
-            for (int z = 1; z < maxZ; z++) {
+            QueryPlanner.Plan plan = pickPlan(stmt.tableName, schema, stmt.whereClause);
+            for (long zLong : rowSource(stmt.tableName, plan)) {
+                int z = (int) zLong;
                 Map<String, Object> row = tableManager.readRow(stmt.tableName, schema, z);
                 if (row == null || row.isEmpty()) continue;
 
@@ -866,6 +917,8 @@ public class SqlExecutor {
                 }
 
                 if (matches) {
+                    IndexManager idx = dbManager.getIndexManager();
+                    if (idx != null) idx.onDelete(stmt.tableName, z, row);
                     tableManager.deleteRow(stmt.tableName, schema, z);
                     deleted++;
                 }
@@ -938,10 +991,67 @@ public class SqlExecutor {
         return QueryResult.ok("Transaction rolled back");
     }
 
+    /** EXPLAIN SELECT/UPDATE/DELETE：不执行语句，输出查询计划 */
+    private QueryResult executeExplain(ExplainStatement stmt) {
+        Statement inner = stmt.inner;
+        if (inner instanceof SelectStatement sel) {
+            return explainTableStatement(sel.tableName, sel.whereClause, "SELECT");
+        }
+        if (inner instanceof UpdateStatement upd) {
+            return explainTableStatement(upd.tableName, upd.whereClause, "UPDATE");
+        }
+        if (inner instanceof DeleteStatement del) {
+            return explainTableStatement(del.tableName, del.whereClause, "DELETE");
+        }
+        return QueryResult.error("EXPLAIN only supports SELECT, UPDATE or DELETE");
+    }
+
+    private QueryResult explainTableStatement(String tableName, WhereClause where, String kind) {
+        TableManager tableManager = dbManager.getTableManager();
+        SchemaManager schemaManager = dbManager.getSchemaManager();
+        IndexManager idx = dbManager.getIndexManager();
+
+        if (!tableManager.tableExists(tableName)) {
+            return QueryResult.error("Table '" + tableName + "' does not exist");
+        }
+        List<ColumnDefinition> schema = schemaManager.getSchema(tableName);
+        if (schema == null) {
+            return QueryResult.error("Schema not found for table '" + tableName + "'");
+        }
+
+        Set<String> indexable = idx != null ? idx.indexableColumns(tableName) : Set.of();
+        QueryPlanner.Plan plan = QueryPlanner.pickPlan(indexable, schema, where);
+
+        String access;
+        String keyInfo = "";
+        String condInfo;
+        String rows;
+        if (plan.indexUsed()) {
+            access = "INDEX SEEK";
+            ColumnDefinition cd = findColumn(schema, plan.column());
+            String key = QueryPlanner.IndexKey.keyFor(cd, plan.key());
+            keyInfo = plan.column() + " (key=" + key
+                    + (idx.isBuilt(tableName, plan.column()) ? "" : ", 尚未构建: 首次使用将全表扫描构建") + ")";
+            condInfo = plan.column() + " = " + plan.key();
+            int candidates = idx.lookup(tableName, plan.column(), plan.key()).size();
+            rows = candidates + " candidate row(s)";
+        } else {
+            access = "FULL TABLE SCAN";
+            condInfo = where != null ? "WHERE 逐行求值" : "无条件";
+            rows = "up to " + (tableManager.getMaxZ(tableName) - 1) + " row(s)";
+        }
+
+        QueryResult result = QueryResult.ok("1 row(s)");
+        result.setColumns(List.of("table", "statement", "access", "key", "condition", "rows"));
+        result.setRows(List.of(List.of(tableName, kind, access, keyInfo, condInfo, rows)));
+        result.setRowCount(1);
+        return result;
+    }
+
     private QueryResult executeCreateIndex(CreateIndexStatement stmt) {
         dbManager.getSchemaManager().addIndex(stmt.tableName, stmt.indexName, stmt.columnName);
         return QueryResult.ok("Index '" + stmt.indexName + "' created on '"
-                + stmt.tableName + "(" + stmt.columnName + ")'（当前索引为元数据，不参与查询计划）");
+                + stmt.tableName + "(" + stmt.columnName + ")'（等值查询将走内存索引，EXPLAIN 可查看计划）");
     }
 
     private QueryResult executeShowIndexes(ShowIndexesStatement stmt) {

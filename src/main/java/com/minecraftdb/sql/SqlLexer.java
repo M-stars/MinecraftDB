@@ -196,7 +196,7 @@ public class SqlLexer {
         ORDER, BY, LIMIT, OFFSET, ASC,
         IN, IS, LIKE,
         IF, EXISTS, DEFAULT, AUTO_INCREMENT,
-        GROUP, AS, DISTINCT, HAVING, BETWEEN, TRUNCATE,
+        GROUP, AS, DISTINCT, HAVING, BETWEEN, TRUNCATE, EXPLAIN,
         VARCHAR, INT, BIGINT, TEXT, BOOLEAN, FLOAT, DOUBLE, DATE, DATETIME,
 
         // Identifiers and literals
@@ -269,6 +269,7 @@ public class SqlLexer {
             MAP.put("having", TokenType.HAVING);
             MAP.put("between", TokenType.BETWEEN);
             MAP.put("truncate", TokenType.TRUNCATE);
+            MAP.put("explain", TokenType.EXPLAIN);
             MAP.put("as", TokenType.AS);
             MAP.put("distinct", TokenType.DISTINCT);
             MAP.put("desc", TokenType.DESC);

@@ -28,6 +28,22 @@ public class WhereClause {
         return root;
     }
 
+    /** 把根结点按 AND 拆成合取项列表（供查询计划器挑选索引条件） */
+    public java.util.List<Node> splitConjuncts() {
+        java.util.List<Node> out = new java.util.ArrayList<>();
+        splitAnd(root, out);
+        return out;
+    }
+
+    private static void splitAnd(Node node, java.util.List<Node> out) {
+        if (node instanceof AndNode and) {
+            splitAnd(and.left, out);
+            splitAnd(and.right, out);
+        } else {
+            out.add(node);
+        }
+    }
+
     /** 行求值入口：columnNames/rowValues 等长对齐，列名大小写不敏感 */
     public boolean evaluate(List<String> columnNames, List<Object> rowValues) {
         return evaluate(resolverOf(columnNames, rowValues));
@@ -168,6 +184,14 @@ public class WhereClause {
             super(operand);
             this.operator = operator;
             this.value = value;
+        }
+
+        public String getOperator() {
+            return operator;
+        }
+
+        public Expression getValue() {
+            return value;
         }
 
         @Override

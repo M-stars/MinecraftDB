@@ -75,7 +75,8 @@ public class TableManager {
 
     // === Row operations ===
 
-    public void insertRow(String tableName, List<ColumnDefinition> schema, Map<String, Object> rowData) {
+    /** 插入一行，返回分配的行号 z（索引维护需要） */
+    public long insertRow(String tableName, List<ColumnDefinition> schema, Map<String, Object> rowData) {
         CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
         if (coords == null) throw new IllegalStateException("Table not found: " + tableName);
 
@@ -96,6 +97,7 @@ public class TableManager {
         }
 
         blockOp.flush();
+        return z;
     }
 
     /**

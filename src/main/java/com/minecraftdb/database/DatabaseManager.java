@@ -29,6 +29,7 @@ public class DatabaseManager {
     private TableManager tableManager;
     private SchemaManager schemaManager;
     private TransactionManager transactionManager;
+    private IndexManager indexManager;
     private SqlExecutor sqlExecutor;
 
     public DatabaseManager(MinecraftServer server) {
@@ -54,6 +55,9 @@ public class DatabaseManager {
         this.tableManager = new TableManager(databaseLevel, coordAllocator, this, transactionManager,
                 ModConfig.PERFORMANCE_BATCH_BLOCK_UPDATES);
         this.schemaManager = new SchemaManager(databaseLevel, coordAllocator);
+        this.indexManager = new IndexManager(tableManager, schemaManager);
+        // 事务中止（回滚/会话中断）→ 方块状态回退，受影响表的内存索引整表失效
+        this.transactionManager.setOnTxnAborted(indexManager::invalidateTables);
         this.sqlExecutor = new SqlExecutor(this);
 
         // 从文件恢复表坐标注册表
@@ -193,6 +197,10 @@ public class DatabaseManager {
 
     public TransactionManager getTransactionManager() {
         return transactionManager;
+    }
+
+    public IndexManager getIndexManager() {
+        return indexManager;
     }
 
     public SqlExecutor getSqlExecutor() {

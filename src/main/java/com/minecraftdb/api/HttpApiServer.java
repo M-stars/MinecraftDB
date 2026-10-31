@@ -142,9 +142,10 @@ public class HttpApiServer {
                 String decoded = URLDecoder.decode(sql, StandardCharsets.UTF_8);
                 // GET 语义只读：写操作必须走 POST /execute，避免被预取/爬虫误触发
                 String head = decoded.trim().toUpperCase(Locale.ROOT);
-                if (!(head.startsWith("SELECT") || head.startsWith("SHOW") || head.startsWith("DESC"))) {
+                if (!(head.startsWith("SELECT") || head.startsWith("SHOW") || head.startsWith("DESC")
+                        || head.startsWith("EXPLAIN"))) {
                     sendJson(exchange, 405, Map.of(
-                            "error", "GET /query 仅允许只读语句（SELECT/SHOW/DESC），写操作请使用 POST /execute"));
+                            "error", "GET /query 仅允许只读语句（SELECT/SHOW/DESC/EXPLAIN），写操作请使用 POST /execute"));
                     return;
                 }
                 SqlExecutor.QueryResult result = dbManager.executeSql(sessionId(exchange), decoded);

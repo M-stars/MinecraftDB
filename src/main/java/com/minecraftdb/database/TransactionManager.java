@@ -56,6 +56,9 @@ public class TransactionManager {
     private final Map<String, ReentrantReadWriteLock> tableLocks = new ConcurrentHashMap<>();
     private final Map<String, Map<Long, ReentrantReadWriteLock>> rowLocks = new ConcurrentHashMap<>();
 
+    /** 事务中止（回滚/会话中断）回调：IndexManager 按触发的表整表失效（由 DatabaseManager 注入） */
+    private java.util.function.Consumer<Iterable<String>> onTxnAborted;
+
     // 会话 → 活跃事务
     private final Map<String, Transaction> activeTxns = new ConcurrentHashMap<>();
     // 当前正在执行语句的会话（仅在主线程上读写）
@@ -73,6 +76,17 @@ public class TransactionManager {
 
     private String extractWorldName() {
         return level.dimension().location().getPath();
+    }
+
+    /** 由 DatabaseManager 在构造完成后注入：事务中止时使受影响的表索引失效 */
+    public void setOnTxnAborted(java.util.function.Consumer<Iterable<String>> callback) {
+        this.onTxnAborted = callback;
+    }
+
+    private void notifyTxnAborted(Transaction txn) {
+        if (onTxnAborted != null && !txn.acquiredTableWriteLocks.isEmpty()) {
+            onTxnAborted.accept(txn.acquiredTableWriteLocks);
+        }
     }
 
     // === 会话绑定 ===
@@ -114,6 +128,7 @@ public class TransactionManager {
     public void endSession(String sessionId) {
         Transaction txn = activeTxns.remove(sessionId);
         if (txn == null) return;
+        notifyTxnAborted(txn);
         txnCloseWal(txn);
         if (walEnabled) {
             deleteWALFile(txn.id);
@@ -178,6 +193,7 @@ public class TransactionManager {
             throw new IllegalStateException("没有活跃事务");
         }
 
+        notifyTxnAborted(txn);
         txnCloseWal(txn);
         if (walEnabled) {
             deleteWALFile(txn.id);

@@ -36,6 +36,7 @@ public class SqlParser {
             case DROP -> parseDrop();
             case ALTER -> parseAlter();
             case TRUNCATE -> parseTruncate();
+            case EXPLAIN -> parseExplain();
             case SHOW -> parseShow();
             case DESC -> parseDesc();
             case BEGIN -> parseBegin();
@@ -356,6 +357,18 @@ public class SqlParser {
         String tableName = parseIdentifier();
         expectOptional(TokenType.SEMICOLON);
         return new DropTableStatement(tableName, ifExists);
+    }
+
+    // === EXPLAIN ===
+
+    private ExplainStatement parseExplain() {
+        expect(TokenType.EXPLAIN);
+        Statement inner = parse();
+        if (!(inner instanceof SelectStatement) && !(inner instanceof UpdateStatement)
+                && !(inner instanceof DeleteStatement)) {
+            throw new ParseException("EXPLAIN only supports SELECT, UPDATE or DELETE");
+        }
+        return new ExplainStatement(inner);
     }
 
     // === TRUNCATE ===

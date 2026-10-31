@@ -18,7 +18,8 @@ public abstract class Statement {
         COMMIT,
         ROLLBACK,
         CREATE_INDEX,
-        SHOW_INDEXES
+        SHOW_INDEXES,
+        EXPLAIN
     }
 
     public abstract Type getType();
