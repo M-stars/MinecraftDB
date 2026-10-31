@@ -225,6 +225,11 @@ public class DatabaseManager {
         return dataPort;
     }
 
+    /** 数据库世界（/db locate 传送跨维度用） */
+    public ServerLevel getLevel() {
+        return databaseLevel;
+    }
+
     public SqlExecutor getSqlExecutor() {
         return sqlExecutor;
     }

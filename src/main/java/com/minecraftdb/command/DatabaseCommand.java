@@ -65,6 +65,15 @@ public class DatabaseCommand {
         root.then(Commands.literal("dump")
             .executes(DatabaseCommand::dumpDatabase));
 
+        // /db locate <表名> — 传送到表旁并显示表信息
+        root.then(Commands.literal("locate")
+            .then(Commands.argument("table", StringArgumentType.word())
+                .executes(ctx -> locateTable(ctx, StringArgumentType.getString(ctx, "table")))));
+
+        // /db signs — 刷新全部表告示牌
+        root.then(Commands.literal("signs")
+            .executes(DatabaseCommand::refreshSigns));
+
         // /db <SQL> — 执行任意 SQL
         root.then(Commands.argument("sql", StringArgumentType.greedyString())
             .executes(DatabaseCommand::executeSql));
@@ -87,10 +96,15 @@ public class DatabaseCommand {
                     msg.append(Component.literal("\n"));
                 }
                 msg.append(Component.literal("\n命令:\n").withStyle(ChatFormatting.WHITE))
-                    .append(Component.literal("  /db <SQL>         执行SQL语句\n"))
-                    .append(Component.literal("  /db cli           进入交互式CLI模式（直接输入SQL）\n"))
-                    .append(Component.literal("  /db tables        列出所有表\n"))
-                    .append(Component.literal("  /db desc <表名>   查看表结构\n"))
+                    .append(Component.literal("  /db <SQL>            执行SQL语句\n"))
+                    .append(Component.literal("  /db cli              进入交互式CLI模式（直接输入SQL）\n"))
+                    .append(Component.literal("  /db tables           列出所有表\n"))
+                    .append(Component.literal("  /db desc <表名>      查看表结构\n"))
+                    .append(Component.literal("  /db locate <表名>    传送到表旁查看数据\n"))
+                    .append(Component.literal("  /db signs            刷新表告示牌\n"))
+                    .append(Component.literal("  /db export <表> [csv|sql]  导出表\n"))
+                    .append(Component.literal("  /db import <表> <文件>     导入CSV\n"))
+                    .append(Component.literal("  /db dump             整库导出SQL\n"))
                     .append(Component.literal("\nCLI模式说明:\n").withStyle(ChatFormatting.WHITE))
                     .append(Component.literal("  进入CLI模式后，直接在聊天栏输入SQL即可执行\n"))
                     .append(Component.literal("  输入 exit 退出CLI模式\n"))
@@ -132,6 +146,65 @@ public class DatabaseCommand {
 
     private static int executeShortcut(CommandContext<CommandSourceStack> ctx, String sql) {
         return executeSqlInternal(ctx.getSource(), sessionId(ctx), sql);
+    }
+
+    // === 游戏内可视化 ===
+
+    private static int locateTable(CommandContext<CommandSourceStack> ctx, String tableName) {
+        DatabaseManager dbManager = MinecraftDB.getDatabaseManager();
+        if (dbManager == null) {
+            ctx.getSource().sendFailure(Component.literal("数据库尚未初始化"));
+            return 0;
+        }
+        var coords = dbManager.getTableManager().getCoords(tableName);
+        if (coords == null) {
+            ctx.getSource().sendFailure(Component.literal("表不存在: " + tableName)
+                    .withStyle(ChatFormatting.RED));
+            return 0;
+        }
+        var schema = dbManager.getSchemaManager().getSchema(tableName);
+        long rows = Math.max(0, coords.nextZ - 1);
+
+        // 玩家传送：地表高度、表头边界带旁（z<0 无数据行），面向表
+        if (ctx.getSource().getEntity() instanceof ServerPlayer player) {
+            var level = dbManager.getLevel();
+            int surfaceY = level.getHeight(
+                    net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING,
+                    coords.xStart, -4);
+            player.teleportTo(level, coords.xStart + 0.5, surfaceY + 1, -4.5,
+                    player.getYRot(), player.getXRot());
+        }
+
+        StringBuilder info = new StringBuilder();
+        info.append("表 '").append(tableName).append("'  X:").append(coords.xStart)
+                .append("-").append(coords.xEnd).append("  行数:").append(rows).append("\n");
+        if (schema != null) {
+            info.append("列: ");
+            for (int i = 0; i < schema.size(); i++) {
+                if (i > 0) info.append(", ");
+                info.append(schema.get(i).name).append(" ").append(schema.get(i).dataType);
+                if (schema.get(i).isPrimaryKey()) info.append(" PK");
+                else if (schema.get(i).isUnique()) info.append(" UQ");
+            }
+        }
+        final String msg = info.toString();
+        ctx.getSource().sendSuccess(() -> Component.literal(msg).withStyle(ChatFormatting.GOLD), false);
+        return 1;
+    }
+
+    private static int refreshSigns(CommandContext<CommandSourceStack> ctx) {
+        DatabaseManager dbManager = MinecraftDB.getDatabaseManager();
+        if (dbManager == null) {
+            ctx.getSource().sendFailure(Component.literal("数据库尚未初始化"));
+            return 0;
+        }
+        dbManager.callOnServerThread(() -> {
+            dbManager.getTableManager().refreshAllSigns();
+            return null;
+        });
+        ctx.getSource().sendSuccess(() -> Component.literal("已刷新全部表告示牌")
+                .withStyle(ChatFormatting.GREEN), false);
+        return 1;
     }
 
     // === 导入 / 导出 ===

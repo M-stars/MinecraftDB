@@ -45,6 +45,11 @@ public class TableManager {
         return coordAllocator.getTableNames();
     }
 
+    /** 表坐标（/db locate 与告示牌刷新用） */
+    public CoordinateAllocator.TableCoords getCoords(String tableName) {
+        return coordAllocator.getCoords(tableName);
+    }
+
     public void createTable(String tableName, List<ColumnDefinition> columns) {
         CoordinateAllocator.TableCoords coords = coordAllocator.allocate(tableName, columns.size());
 
@@ -58,6 +63,57 @@ public class TableManager {
         // 数据区保持空气：空气 = 列数据结束符，写入数据时再放羊毛
         dbManager.saveTableRegistry();
         blockOp.flush();
+
+        // 表名告示牌（立在表头边界，游戏内可走进来「看见」表）
+        updateTableSign(tableName);
+    }
+
+    // === 表告示牌 ===
+
+    /** 建表时放置/刷新表名告示牌（z=0 边界带无数据行，不会与羊毛冲突） */
+    public void updateTableSign(String tableName) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
+        if (coords == null) return;
+
+        int x = coords.xStart;
+        int signY = findSignY(x);
+        if (signY < 0) {
+            // 无现存告示牌：放在地表之上
+            int topY = level.getHeight(net.minecraft.world.level.levelgen.Heightmap.Types.WORLD_SURFACE, x, 0);
+            signY = Math.max(topY, WorldUtils.DATA_START_Y);
+        }
+        BlockPos signPos = new BlockPos(x, signY, 0);
+        if (!(level.getBlockState(signPos).getBlock() instanceof net.minecraft.world.level.block.StandingSignBlock)) {
+            level.setBlock(signPos, net.minecraft.world.level.block.Blocks.OAK_SIGN.defaultBlockState(), 3);
+        }
+        if (level.getBlockEntity(signPos) instanceof net.minecraft.world.level.block.entity.SignBlockEntity sign) {
+            long rows = Math.max(0, coords.nextZ - 1);
+            sign.updateText(text -> text
+                    .setMessage(0, net.minecraft.network.chat.Component.literal("MinecraftDB"))
+                    .setMessage(1, net.minecraft.network.chat.Component.literal(tableName))
+                    .setMessage(2, net.minecraft.network.chat.Component.literal(
+                            "X " + coords.xStart + "-" + coords.xEnd))
+                    .setMessage(3, net.minecraft.network.chat.Component.literal(rows + " rows")), true);
+            sign.setChanged();
+        }
+    }
+
+    /** 在 (x, ?, 0) 边界带上找现存告示牌的 Y；无则返回 -1 */
+    private int findSignY(int x) {
+        for (int y = WorldUtils.DATA_MAX_Y; y >= WorldUtils.DATA_START_Y; y--) {
+            if (level.getBlockState(new BlockPos(x, y, 0)).getBlock()
+                    instanceof net.minecraft.world.level.block.StandingSignBlock) {
+                return y;
+            }
+        }
+        return -1;
+    }
+
+    /** 刷新全部表告示牌（/db signs） */
+    public void refreshAllSigns() {
+        for (String t : coordAllocator.getTableNames()) {
+            updateTableSign(t);
+        }
     }
 
     /**
