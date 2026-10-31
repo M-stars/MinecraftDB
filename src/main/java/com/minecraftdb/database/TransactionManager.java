@@ -450,45 +450,23 @@ public class TransactionManager {
                                   && f.getFileName().toString().endsWith(".wal"))
                      .forEach(f -> {
                          try {
-                             List<WALEntry> entries = new ArrayList<>();
-                             boolean committed = false;
-                             boolean corrupt = false;
-                             for (String line : Files.readAllLines(f)) {
-                                 if (line.isBlank()) continue;
-                                 try {
-                                     WALEntry e = gson.fromJson(line, WALEntry.class);
-                                     if (e == null) {
-                                         corrupt = true;
-                                         break;
-                                     }
-                                     if ("COMMIT".equals(e.type)) {
-                                         committed = true;
-                                         break;
-                                     }
-                                     if ("OP".equals(e.type)) {
-                                         entries.add(e);
-                                     }
-                                 } catch (Exception parseError) {
-                                     corrupt = true;
-                                     break;
-                                 }
-                             }
-                             if (!corrupt) {
-                                 if (committed) {
+                             WalRecovery.Plan plan = WalRecovery.analyze(Files.readAllLines(f));
+                             if (!plan.corrupt()) {
+                                 if (plan.committed()) {
                                      // 已提交：WAL 在方块入队时记录，提交行之后才删除文件，
                                      // 因此 COMMIT 存在时方块可能尚未应用（分 tick 排水中途崩溃）——
                                      // 按 OP 顺序重放 newColor（幂等：已应用的写入重复设置结果不变）
-                                     for (WALEntry e : entries) {
+                                     for (WALEntry e : plan.ops()) {
                                          applyEntry(e);
                                      }
                                  } else {
                                      // 未提交：逆序恢复 oldColor（对未应用的方块是无害的幂等操作）
-                                     for (int i = entries.size() - 1; i >= 0; i--) {
-                                         restoreEntry(entries.get(i));
+                                     for (WALEntry e : plan.opsReversed()) {
+                                         restoreEntry(e);
                                      }
                                  }
                              }
-                             if (corrupt) {
+                             if (plan.corrupt()) {
                                  Files.move(f, f.resolveSibling(f.getFileName() + ".corrupt"),
                                          java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                              } else {
