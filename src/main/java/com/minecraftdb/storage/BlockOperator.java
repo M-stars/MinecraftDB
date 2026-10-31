@@ -2,10 +2,13 @@ package com.minecraftdb.storage;
 
 import com.minecraftdb.config.ModConfig;
 import com.minecraftdb.database.TransactionManager;
+import com.minecraftdb.database.TransactionManager.Transaction;
 import com.minecraftdb.util.WorldUtils;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.DyeColor;
+
+import java.util.Map;
 
 /**
  * Encapsulates block read/write operations with batching support.
@@ -67,23 +70,41 @@ public class BlockOperator {
     }
 
     /**
-     * 批量模式：记录进待应用日志（WAL 同步入队）。目标状态相同则跳过。
+     * 批量模式：事务写缓冲优先（MVCC——事务内写入不落世界，提交时统一入全局队列），
+     * 否则进待应用日志。WAL 均同步入队。目标状态相同则跳过。
      */
     private void enqueue(BlockPos pos, DyeColor color) {
         DyeColor effective = effectiveColor(pos);
         if (effective == color) return;
 
-        long txnId = txnManager != null ? txnManager.currentTxnId() : -1;
+        long txnId = -1;
+        Map<BlockPos, Transaction.OverlayEntry> overlay =
+                txnManager != null ? txnManager.currentTxnOverlay() : null;
+        if (overlay != null) {
+            // 写缓冲：保留首次写入的旧色（冲突检测基准），更新最终值
+            Transaction.OverlayEntry existing = overlay.get(pos);
+            DyeColor expectedOld = existing != null ? existing.expectedOld() : effective;
+            overlay.put(pos, new Transaction.OverlayEntry(expectedOld, color));
+            txnId = txnManager.currentTxnId();
+        } else {
+            txnId = txnManager != null ? txnManager.currentTxnId() : -1;
+            pendingLog.add(txnId, pos, color);
+        }
         if (txnManager != null) {
             txnManager.logBlockChange("", pos.getX(), pos.getY(), pos.getZ(),
                     effective == null ? null : effective.name(),
                     color == null ? null : color.name());
         }
-        pendingLog.add(txnId, pos, color);
     }
 
-    /** 覆盖层优先：有待应用写入取待应用值，否则读世界 */
+    /** 覆盖优先级：事务写缓冲 → 全局待应用 → 世界 */
     private DyeColor effectiveColor(BlockPos pos) {
+        if (txnManager != null) {
+            Map<BlockPos, Transaction.OverlayEntry> overlay = txnManager.currentTxnOverlay();
+            if (overlay != null && overlay.containsKey(pos)) {
+                return overlay.get(pos).color();
+            }
+        }
         if (pendingLog.hasPending(pos)) return pendingLog.pendingColor(pos);
         return WorldUtils.getWoolColor(level, pos);
     }
@@ -171,9 +192,28 @@ public class BlockOperator {
     }
 
     public DyeColor readWool(BlockPos pos) {
+        // 读穿覆盖：事务写缓冲（读己之写）→ 全局待应用（分 tick 排水中）→ 世界
+        if (txnManager != null) {
+            Map<BlockPos, Transaction.OverlayEntry> overlay = txnManager.currentTxnOverlay();
+            if (overlay != null && overlay.containsKey(pos)) {
+                return overlay.get(pos).color(); // null = 缓冲的清除（空气）
+            }
+        }
         if (batchMode && pendingLog.hasPending(pos)) {
             return pendingLog.pendingColor(pos); // null = 待应用清除（空气）
         }
         return WorldUtils.getWoolColor(level, pos);
+    }
+
+    /**
+     * 事务提交：把会话写缓冲移入全局排水队列（冲突检测已由 TransactionManager 完成）。
+     * 此后方块变更经分 tick 排水落世界；读取经全局待应用覆盖立即可见。
+     */
+    public void commitOverlay(long txnId,
+                              Map<BlockPos, Transaction.OverlayEntry> overlay) {
+        for (Map.Entry<BlockPos, Transaction.OverlayEntry> e : overlay.entrySet()) {
+            pendingLog.add(txnId, e.getKey(), e.getValue().color());
+        }
+        overlay.clear();
     }
 }

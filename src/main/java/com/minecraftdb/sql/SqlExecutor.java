@@ -284,8 +284,10 @@ public class SqlExecutor {
                 }
 
                 long z = tableManager.insertRow(stmt.tableName, schema, rowData);
-                IndexManager idx = dbManager.getIndexManager();
-                if (idx != null) idx.onInsert(stmt.tableName, z, rowData);
+                recordIndexOp(stmt.tableName, () -> {
+                    IndexManager idx = dbManager.getIndexManager();
+                    if (idx != null) idx.onInsert(stmt.tableName, z, rowData);
+                });
                 inserted++;
             }
             if (autoCommit) {
@@ -317,12 +319,14 @@ public class SqlExecutor {
     }
 
     /** 在表中查找与 value 相等的行（唯一性检查）；excludeZ 用于 UPDATE 排除本行。
-     *  列可索引时走内存索引（候选集是超集，命中后仍逐行复核），否则回退全列扫描。 */
+     *  列可索引时走内存索引（候选集是超集，命中后仍逐行复核），否则回退全列扫描。
+     *  当前事务写过该表时绕过索引——未提交的重复值只有全扫描（经写缓冲读）能发现。 */
     private Long findDuplicateZ(String tableName, List<ColumnDefinition> schema, ColumnDefinition col,
                                 Object value, long excludeZ) {
         TableManager tm = dbManager.getTableManager();
         IndexManager idx = dbManager.getIndexManager();
-        if (idx != null && idx.isIndexable(tableName, col.name)) {
+        boolean txnDirty = dbManager.getTransactionManager().currentTxnWroteTable(tableName);
+        if (idx != null && !txnDirty && idx.isIndexable(tableName, col.name)) {
             for (long z : idx.lookup(tableName, col.name, value)) {
                 if (z == excludeZ) continue;
                 Map<String, Object> row = tm.readRow(tableName, schema, (int) z);
@@ -923,12 +927,21 @@ public class SqlExecutor {
         return row.isEmpty() ? null : row.get(0);
     }
 
+    /** 记录索引维护操作：事务内延迟到提交点应用，无事务立即应用 */
+    private void recordIndexOp(String table, Runnable op) {
+        dbManager.getTransactionManager().recordIndexOp(table, op);
+    }
+
     // === 查询计划 ===
 
-    /** 为语句挑查询计划：索引等值查找或全表扫描（IndexManager 不可用时一律全扫描） */
+    /** 为语句挑查询计划：索引等值查找或全表扫描（IndexManager 不可用时一律全扫描）。
+     *  当前事务写过该表时绕过索引走全扫描——索引是提交态，必须全扫才能读到自己的未提交写入。 */
     private QueryPlanner.Plan pickPlan(String tableName, List<ColumnDefinition> schema, WhereClause where) {
         IndexManager idx = dbManager.getIndexManager();
         if (idx == null) return new QueryPlanner.Plan(null, null, false);
+        if (dbManager.getTransactionManager().currentTxnWroteTable(tableName)) {
+            return new QueryPlanner.Plan(null, null, false);
+        }
         return QueryPlanner.pickPlan(idx.indexableColumns(tableName), schema, where);
     }
 
@@ -1092,6 +1105,7 @@ public class SqlExecutor {
 
         int updated = 0;
         try {
+            final String updateTable = stmt.tableName;
             QueryPlanner.Plan plan = pickPlan(stmt.tableName, schema, stmt.whereClause);
             for (long zLong : rowSource(stmt.tableName, plan)) {
                 int z = (int) zLong;
@@ -1134,11 +1148,13 @@ public class SqlExecutor {
                         }
                         newValues.put(cd.name, v);
                     }
-                    // 索引维护：以「更新后的完整行」重登记值发生变化的可索引列
+                    // 索引维护：以「更新后的完整行」重登记值发生变化的可索引列（提交点应用）
                     Map<String, Object> merged = new LinkedHashMap<>(row);
                     merged.putAll(newValues);
-                    IndexManager idx = dbManager.getIndexManager();
-                    if (idx != null) idx.onUpdate(stmt.tableName, z, row, merged);
+                    recordIndexOp(updateTable, () -> {
+                        IndexManager idx = dbManager.getIndexManager();
+                        if (idx != null) idx.onUpdate(updateTable, z, row, merged);
+                    });
                     tableManager.updateRow(stmt.tableName, schema, z, newValues);
                     updated++;
                 }
@@ -1182,6 +1198,7 @@ public class SqlExecutor {
 
         int deleted = 0;
         try {
+            final String deleteTable = stmt.tableName;
             // 流式逐行判断并删除，全部完成后合并为一次批量 flush
             QueryPlanner.Plan plan = pickPlan(stmt.tableName, schema, stmt.whereClause);
             for (long zLong : rowSource(stmt.tableName, plan)) {
@@ -1199,8 +1216,10 @@ public class SqlExecutor {
                 }
 
                 if (matches) {
-                    IndexManager idx = dbManager.getIndexManager();
-                    if (idx != null) idx.onDelete(stmt.tableName, z, row);
+                    recordIndexOp(deleteTable, () -> {
+                        IndexManager idx = dbManager.getIndexManager();
+                        if (idx != null) idx.onDelete(deleteTable, z, row);
+                    });
                     tableManager.deleteRow(stmt.tableName, schema, z);
                     deleted++;
                 }
@@ -1301,7 +1320,10 @@ public class SqlExecutor {
         }
 
         Set<String> indexable = idx != null ? idx.indexableColumns(tableName) : Set.of();
-        QueryPlanner.Plan plan = QueryPlanner.pickPlan(indexable, schema, where);
+        // 与实际执行一致：当前事务写过该表时走全扫描（读己之写）
+        QueryPlanner.Plan plan = dbManager.getTransactionManager().currentTxnWroteTable(tableName)
+                ? new QueryPlanner.Plan(null, null, false)
+                : QueryPlanner.pickPlan(indexable, schema, where);
 
         String access;
         String keyInfo = "";

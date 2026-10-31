@@ -58,6 +58,8 @@ public class TransactionManager {
 
     /** 事务中止（回滚/会话中断）回调：索引失效 + 待应用方块写入清除（由 DatabaseManager 注入） */
     private java.util.function.Consumer<Transaction> onTxnAborted;
+    /** 事务提交回调：把会话私有的写缓冲移入全局排水队列（由 DatabaseManager 注入 BlockOperator） */
+    private java.util.function.Consumer<Transaction> onTxnCommit;
 
     // 会话 → 活跃事务
     private final Map<String, Transaction> activeTxns = new ConcurrentHashMap<>();
@@ -83,6 +85,11 @@ public class TransactionManager {
         this.onTxnAborted = callback;
     }
 
+    /** 由 DatabaseManager 注入：提交时把会话写缓冲移入全局排水队列（冲突检测之后） */
+    public void setOnTxnCommit(java.util.function.Consumer<Transaction> callback) {
+        this.onTxnCommit = callback;
+    }
+
     private void notifyTxnAborted(Transaction txn) {
         if (onTxnAborted != null) {
             onTxnAborted.accept(txn);
@@ -93,6 +100,36 @@ public class TransactionManager {
     public long currentTxnId() {
         Transaction txn = currentTxn();
         return txn != null ? txn.id : -1;
+    }
+
+    /** 当前会话事务的写缓冲；无活跃事务返回 null（BlockOperator 据此分流） */
+    public Map<BlockPos, Transaction.OverlayEntry> currentTxnOverlay() {
+        Transaction txn = currentTxn();
+        return txn != null ? txn.overlay : null;
+    }
+
+    /** 当前会话事务是否写过指定表（读路径绕过内存索引以保证读己之写） */
+    public boolean currentTxnWroteTable(String tableName) {
+        Transaction txn = currentTxn();
+        if (txn == null) return false;
+        for (String t : txn.wroteTables) {
+            if (t.equalsIgnoreCase(tableName)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 记录一条索引维护操作。事务内延迟到提交点应用（写缓冲期间索引保持提交态，
+     * 避免未提交数据泄漏给其他会话的索引查询）；无事务时立即应用。
+     */
+    public void recordIndexOp(String tableName, Runnable op) {
+        Transaction txn = currentTxn();
+        if (txn != null) {
+            txn.indexOps.add(op);
+            txn.wroteTables.add(tableName);
+        } else {
+            op.run();
+        }
     }
 
     // === 会话绑定 ===
@@ -139,8 +176,11 @@ public class TransactionManager {
         if (walEnabled) {
             deleteWALFile(txn.id);
         }
-        for (int i = txn.walEntries.size() - 1; i >= 0; i--) {
-            restoreEntry(txn.walEntries.get(i));
+        // 写缓冲模式：方块从未落世界，无需恢复（恢复反而会覆盖其他事务已提交的值）
+        if (!txn.bufferedWrites) {
+            for (int i = txn.walEntries.size() - 1; i >= 0; i--) {
+                restoreEntry(txn.walEntries.get(i));
+            }
         }
         releaseAllLocks(txn);
     }
@@ -175,6 +215,27 @@ public class TransactionManager {
             throw new IllegalStateException("没有活跃事务");
         }
 
+        // 写缓冲冲突检测（首提交者胜）：世界当前颜色 != 本事务写入时的旧色
+        // → 其他事务已提交对同方块的修改 → 拒绝提交，事务保持开启供 ROLLBACK
+        for (Map.Entry<BlockPos, Transaction.OverlayEntry> e : txn.overlay.entrySet()) {
+            DyeColor worldNow = WorldUtils.getWoolColor(level, e.getKey());
+            DyeColor expectedOld = e.getValue().expectedOld();
+            if (!java.util.Objects.equals(worldNow, expectedOld)) {
+                throw new IllegalStateException("提交冲突（快照隔离，首提交者胜）：方块 "
+                        + e.getKey().toShortString() + " 已被其他事务修改，请 ROLLBACK 后重试");
+            }
+        }
+
+        // 冲突通过 → 写缓冲移入全局排水队列（经由 BlockOperator）
+        if (onTxnCommit != null && !txn.overlay.isEmpty()) {
+            onTxnCommit.accept(txn);
+        }
+
+        // 索引维护操作在提交点应用（写缓冲期间索引保持提交态）
+        for (Runnable op : txn.indexOps) {
+            op.run();
+        }
+
         if (walEnabled) {
             try {
                 txnWriteLine(txn, WALEntry.commit(txn.id));
@@ -205,9 +266,11 @@ public class TransactionManager {
             deleteWALFile(txn.id);
         }
 
-        // 逆序恢复所有已应用的方块变更
-        for (int i = txn.walEntries.size() - 1; i >= 0; i--) {
-            restoreEntry(txn.walEntries.get(i));
+        // 写缓冲模式：方块从未落世界，跳过恢复；否则逆序恢复所有已应用的方块变更
+        if (!txn.bufferedWrites) {
+            for (int i = txn.walEntries.size() - 1; i >= 0; i--) {
+                restoreEntry(txn.walEntries.get(i));
+            }
         }
 
         releaseAllLocks(txn);
@@ -448,10 +511,27 @@ public class TransactionManager {
         public final List<WALEntry> walEntries = new ArrayList<>();
         public BufferedWriter walWriter; // 事务私有 WAL 写入器
 
+        /**
+         * 会话私有写缓冲（MVCC）：事务内方块写入先入此缓冲而不落世界，
+         * 其他会话读到的是最后提交状态（无脏读）。键为方块坐标；expectedOld
+         * 记录本事务首次写入前的世界颜色（同方块多次写入保留最早的），供提交时
+         * 做首提交者胜冲突检测；color 为最终写入值（null = 空气）。
+         */
+        public final Map<BlockPos, OverlayEntry> overlay = new LinkedHashMap<>();
+        /** 事务是否使用了写缓冲（决定回滚时是否需要恢复方块） */
+        public boolean bufferedWrites = false;
+        /** 索引维护操作：写缓冲期间延迟到提交点应用，回滚即丢弃 */
+        public final List<Runnable> indexOps = new ArrayList<>();
+        /** 本事务写过数据的表（用于读路径绕过内存索引，保证读己之写） */
+        public final Set<String> wroteTables = new LinkedHashSet<>();
+
         public Transaction(long id) {
             this.id = id;
             this.timestamp = System.currentTimeMillis();
         }
+
+        /** 方块写入的缓冲条目 */
+        public record OverlayEntry(DyeColor expectedOld, DyeColor color) {}
     }
 
     public record RowLockKey(String table, long z) {}

@@ -62,6 +62,9 @@ public class DatabaseManager {
             indexManager.invalidateTables(txn.acquiredTableWriteLocks);
             tableManager.getBlockOperator().purgeTxn(txn.id);
         });
+        // 事务提交：冲突检测通过后，把会话写缓冲移入全局排水队列
+        this.transactionManager.setOnTxnCommit(txn ->
+                tableManager.getBlockOperator().commitOverlay(txn.id, txn.overlay));
         this.sqlExecutor = new SqlExecutor(this);
 
         // 从文件恢复表坐标注册表
