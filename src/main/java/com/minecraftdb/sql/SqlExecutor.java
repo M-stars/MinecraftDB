@@ -46,6 +46,7 @@ public class SqlExecutor {
             case CREATE_TABLE -> executeCreateTable((CreateTableStatement) stmt);
             case DROP_TABLE -> executeDropTable((DropTableStatement) stmt);
             case ALTER_TABLE -> executeAlterTable((AlterTableStatement) stmt);
+            case TRUNCATE_TABLE -> executeTruncate((TruncateStatement) stmt);
             case INSERT -> executeInsert((InsertStatement) stmt);
             case SELECT -> executeSelect((SelectStatement) stmt);
             case UPDATE -> executeUpdate((UpdateStatement) stmt);
@@ -146,6 +147,35 @@ public class SqlExecutor {
         } finally {
             if (!inTxn) txnManager.releaseTableWriteLock(stmt.tableName);
         }
+    }
+
+    /**
+     * TRUNCATE [TABLE]：清空全部行并重置自增（nextZ 归 1）。
+     * DDL 语义（隐式提交、不可回滚），事务内执行直接报错。
+     */
+    private QueryResult executeTruncate(TruncateStatement stmt) {
+        TableManager tableManager = dbManager.getTableManager();
+        SchemaManager schemaManager = dbManager.getSchemaManager();
+        TransactionManager txnManager = dbManager.getTransactionManager();
+
+        if (!tableManager.tableExists(stmt.tableName)) {
+            return QueryResult.error("Table '" + stmt.tableName + "' does not exist");
+        }
+        List<ColumnDefinition> schema = schemaManager.getSchema(stmt.tableName);
+        if (schema == null) {
+            return QueryResult.error("Schema not found for table '" + stmt.tableName + "'");
+        }
+        if (txnManager.isInTransaction()) {
+            return QueryResult.error("TRUNCATE is a DDL statement (implicit commit) and cannot run inside a transaction");
+        }
+
+        txnManager.acquireTableWriteLock(stmt.tableName);
+        try {
+            tableManager.truncateTable(stmt.tableName, schema);
+        } finally {
+            txnManager.releaseTableWriteLock(stmt.tableName);
+        }
+        return QueryResult.ok("Table '" + stmt.tableName + "' truncated");
     }
 
     private QueryResult executeInsert(InsertStatement stmt) {
@@ -322,10 +352,21 @@ public class SqlExecutor {
         if (items == null) { // 旧构造器：从 columns 推导
             items = new ArrayList<>();
             for (String c : stmt.columns) {
-                items.add(new SelectStatement.SelectItem(null, c, c));
+                items.add(new SelectStatement.SelectItem(new Expression.ColumnRef(c), c));
             }
         }
-        boolean aggregateMode = !stmt.groupBy.isEmpty()
+
+        // WHERE 中不允许聚合（标准 SQL 语义）
+        if (stmt.whereClause != null) {
+            Set<String> whereAggs = new LinkedHashSet<>();
+            stmt.whereClause.collectAggregateNames(whereAggs);
+            if (!whereAggs.isEmpty()) {
+                return QueryResult.error("Aggregate function " + whereAggs.iterator().next()
+                        + " is not allowed in WHERE (use HAVING)");
+            }
+        }
+
+        boolean aggregateMode = !stmt.groupBy.isEmpty() || stmt.havingClause != null
                 || items.stream().anyMatch(i -> i.function() != null);
 
         // ORDER BY 解析：优先匹配输出列（SELECT 别名 / 聚合表达式），
@@ -408,7 +449,7 @@ public class SqlExecutor {
         List<List<Object>> rows = new ArrayList<>();
 
         if (aggregateMode) {
-            // ---- 校验 SELECT 项与 GROUP BY ----
+            // ---- 校验 GROUP BY 列 ----
             Set<String> groupByResolved = new LinkedHashSet<>();
             for (String g : stmt.groupBy) {
                 ColumnDefinition cd = findColumn(schema, g);
@@ -417,20 +458,35 @@ public class SqlExecutor {
                 }
                 groupByResolved.add(cd.name);
             }
+
+            // ---- 收集并校验聚合调用（SELECT 项 + HAVING）----
+            Set<String> aggCanonicals = new LinkedHashSet<>();
             for (SelectStatement.SelectItem item : items) {
-                if (item.function() == null) {
-                    ColumnDefinition cd = findColumn(schema, item.column());
-                    if (cd == null) {
-                        return QueryResult.error("Unknown column '" + item.column() + "' in SELECT");
-                    }
-                    if (!groupByResolved.contains(cd.name)) {
-                        return QueryResult.error("Column '" + item.column()
-                                + "' must appear in GROUP BY or be used in an aggregate");
-                    }
-                } else if (!"*".equals(item.column())
-                        && findColumn(schema, item.column()) == null) {
-                    return QueryResult.error("Unknown column '" + item.column()
-                            + "' in " + item.function());
+                Expression.collectAggregates(item.expr(), aggCanonicals);
+            }
+            if (stmt.havingClause != null) {
+                stmt.havingClause.collectAggregateNames(aggCanonicals);
+            }
+            for (String canonical : aggCanonicals) {
+                String[] fnArg = splitAggregateCanonical(canonical);
+                if (!"*".equals(fnArg[1]) && findColumn(schema, fnArg[1]) == null) {
+                    return QueryResult.error("Unknown column '" + fnArg[1] + "' in " + fnArg[0]);
+                }
+            }
+
+            // ---- 校验 SELECT 项中的裸列必须出现在 GROUP BY ----
+            Set<String> bareColumns = new LinkedHashSet<>();
+            for (SelectStatement.SelectItem item : items) {
+                Expression.collectBareColumns(item.expr(), bareColumns);
+            }
+            for (String c : bareColumns) {
+                ColumnDefinition cd = findColumn(schema, c);
+                if (cd == null) {
+                    return QueryResult.error("Unknown column '" + c + "' in SELECT");
+                }
+                if (!groupByResolved.contains(cd.name)) {
+                    return QueryResult.error("Column '" + c
+                            + "' must appear in GROUP BY or be used in an aggregate");
                 }
             }
 
@@ -453,25 +509,71 @@ public class SqlExecutor {
                 outColumns.add(item.label());
             }
             for (List<Map<String, Object>> groupRows : groups.values()) {
+                // 组内聚合预计算，键为规范化名（小写）
+                Map<String, Object> aggValues = new HashMap<>();
+                for (String canonical : aggCanonicals) {
+                    String[] fnArg = splitAggregateCanonical(canonical);
+                    aggValues.put(canonical.toLowerCase(Locale.ROOT),
+                            computeAggregate(fnArg[0], fnArg[1], schema, groupRows));
+                }
+                Map<String, Object> firstRow = groupRows.isEmpty() ? Map.of() : groupRows.get(0);
+                List<Object> firstValues = new ArrayList<>();
+                for (String col : columnNames) {
+                    firstValues.add(firstRow.get(col));
+                }
+                Expression.Resolver rowRes = WhereClause.resolverOf(columnNames, firstValues);
+                Expression.Resolver resolver = name -> {
+                    String key = name.toLowerCase(Locale.ROOT);
+                    if (aggValues.containsKey(key)) return aggValues.get(key);
+                    return rowRes.value(name);
+                };
+
                 List<Object> out = new ArrayList<>();
                 for (SelectStatement.SelectItem item : items) {
-                    if (item.function() == null) {
-                        out.add(groupRows.isEmpty() ? null
-                                : groupRows.get(0).get(resolveSchemaName(schema, item.column())));
-                    } else {
-                        out.add(computeAggregate(item.function(), item.column(), schema, groupRows));
-                    }
+                    out.add(item.expr().eval(resolver));
+                }
+
+                // HAVING 过滤：优先按输出列（别名），其次组内聚合，最后组首行
+                if (stmt.havingClause != null) {
+                    Expression.Resolver havingRes = new Expression.Resolver() {
+                        @Override
+                        public Object value(String name) {
+                            int idx = indexOfIgnoreCase(outColumns, name);
+                            if (idx >= 0) return out.get(idx);
+                            String key = name.toLowerCase(Locale.ROOT);
+                            if (aggValues.containsKey(key)) return aggValues.get(key);
+                            return rowRes.value(name);
+                        }
+
+                        @Override
+                        public boolean exists(String name) {
+                            if (indexOfIgnoreCase(outColumns, name) >= 0) return true;
+                            String key = name.toLowerCase(Locale.ROOT);
+                            if (aggValues.containsKey(key)) return true;
+                            return rowRes.exists(name);
+                        }
+                    };
+                    if (!stmt.havingClause.evaluate(havingRes)) continue;
                 }
                 rows.add(out);
             }
         } else {
             outColumns = stmt.isSelectAll() ? columnNames : stmt.columns;
             for (Map<String, Object> row : collected) {
-                List<Object> projected = new ArrayList<>();
-                for (String col : outColumns) {
-                    projected.add(row.getOrDefault(col, null));
+                if (stmt.isSelectAll()) {
+                    rows.add(new ArrayList<>(row.values()));
+                } else {
+                    List<Object> rowValues = new ArrayList<>();
+                    for (String col : columnNames) {
+                        rowValues.add(row.get(col));
+                    }
+                    Expression.Resolver rowRes = WhereClause.resolverOf(columnNames, rowValues);
+                    List<Object> projected = new ArrayList<>();
+                    for (SelectStatement.SelectItem item : items) {
+                        projected.add(item.expr().eval(rowRes));
+                    }
+                    rows.add(projected);
                 }
-                rows.add(projected);
             }
         }
 
@@ -526,6 +628,23 @@ public class SqlExecutor {
     private String resolveSchemaName(List<ColumnDefinition> schema, String col) {
         ColumnDefinition cd = findColumn(schema, col);
         return cd != null ? cd.name : col;
+    }
+
+    /** 聚合规范化名拆分：COUNT(*) → [COUNT, *]，SUM(price) → [SUM, price] */
+    private static String[] splitAggregateCanonical(String canonical) {
+        int lp = canonical.indexOf('(');
+        int rp = canonical.lastIndexOf(')');
+        if (lp <= 0 || rp != canonical.length() - 1) {
+            return new String[]{canonical, canonical};
+        }
+        return new String[]{canonical.substring(0, lp), canonical.substring(lp + 1, rp)};
+    }
+
+    private static int indexOfIgnoreCase(List<String> list, String name) {
+        for (int i = 0; i < list.size(); i++) {
+            if (list.get(i).equalsIgnoreCase(name)) return i;
+        }
+        return -1;
     }
 
     /** 聚合计算：COUNT/SUM/AVG/MIN/MAX；SUM/AVG 只统计数值行，MIN/MAX 兼容字符串 */
@@ -629,14 +748,18 @@ public class SqlExecutor {
             columnNames.add(cd.name);
         }
 
-        // SET 赋值只解析一次、只含被 SET 的列（此前每行重复解析且整行重写）
-        Map<String, Object> parsedAssignments = new LinkedHashMap<>();
-        for (Map.Entry<String, String> assign : stmt.assignments.entrySet()) {
+        // SET 赋值校验：列存在、不含聚合（表达式在每行求值，支持 col = col + 1）
+        for (Map.Entry<String, Expression> assign : stmt.assignments.entrySet()) {
             ColumnDefinition colDef = findColumn(schema, assign.getKey());
             if (colDef == null) {
                 return QueryResult.error("Unknown column '" + assign.getKey() + "' in SET clause");
             }
-            parsedAssignments.put(colDef.name, parseValue(assign.getValue(), colDef.dataType));
+            Set<String> aggs = new LinkedHashSet<>();
+            Expression.collectAggregates(assign.getValue(), aggs);
+            if (!aggs.isEmpty()) {
+                return QueryResult.error("Aggregate function " + aggs.iterator().next()
+                        + " is not allowed in SET clause");
+            }
         }
 
         boolean autoCommit = !txnManager.isInTransaction();
@@ -651,19 +774,21 @@ public class SqlExecutor {
                 if (row == null || row.isEmpty()) continue;
 
                 boolean matches = true;
+                List<Object> rowValues = new ArrayList<>();
+                for (String col : columnNames) {
+                    rowValues.add(row.get(col));
+                }
                 if (stmt.whereClause != null) {
-                    List<Object> rowValues = new ArrayList<>();
-                    for (String col : columnNames) {
-                        rowValues.add(row.get(col));
-                    }
                     matches = stmt.whereClause.evaluate(columnNames, rowValues);
                 }
 
                 if (matches) {
-                    // 校验被 SET 的列：主键/自增列唯一性与非空，其余列 NOT NULL
-                    for (ColumnDefinition cd : schema) {
-                        if (!parsedAssignments.containsKey(cd.name)) continue;
-                        Object v = parsedAssignments.get(cd.name);
+                    // 逐列求值 SET 表达式（基于本行原值），并校验主键/自增唯一性与非空
+                    Expression.Resolver rowRes = WhereClause.resolverOf(columnNames, rowValues);
+                    Map<String, Object> newValues = new LinkedHashMap<>();
+                    for (Map.Entry<String, Expression> assign : stmt.assignments.entrySet()) {
+                        ColumnDefinition cd = findColumn(schema, assign.getKey());
+                        Object v = coerceValue(assign.getValue().eval(rowRes), cd.dataType);
                         if (v == null) {
                             if (cd.isPrimaryKey() || cd.autoIncrement) {
                                 throw new IllegalStateException("Column '" + cd.name
@@ -674,9 +799,7 @@ public class SqlExecutor {
                                 throw new IllegalStateException("Column '" + cd.name
                                         + "' cannot be set to NULL (NOT NULL constraint)");
                             }
-                            continue;
-                        }
-                        if (cd.isPrimaryKey() || cd.autoIncrement) {
+                        } else if (cd.isPrimaryKey() || cd.autoIncrement) {
                             Long dup = findDuplicateZ(stmt.tableName, schema, cd, v, z);
                             if (dup != null) {
                                 throw new IllegalStateException("Duplicate value '" + v
@@ -684,8 +807,9 @@ public class SqlExecutor {
                                         + " column '" + cd.name + "' (existing row at z=" + dup + ")");
                             }
                         }
+                        newValues.put(cd.name, v);
                     }
-                    tableManager.updateRow(stmt.tableName, schema, z, parsedAssignments);
+                    tableManager.updateRow(stmt.tableName, schema, z, newValues);
                     updated++;
                 }
             }
@@ -841,6 +965,73 @@ public class SqlExecutor {
             if (cd.name.equalsIgnoreCase(name)) return cd;
         }
         return null;
+    }
+
+    /**
+     * 将表达式求值结果转换为列类型（UPDATE SET 用）。null 直通。
+     * 字符串按列类型严格解析（报错信息与 parseValue 一致）；数值按四舍五入取整。
+     */
+    private Object coerceValue(Object v, String dataType) {
+        if (v == null) return null;
+        String typeBase = dataType.split("\\(")[0].toUpperCase();
+
+        switch (typeBase) {
+            case "INT", "INTEGER": {
+                long lv = requireIntegral(v, typeBase);
+                if (lv < Integer.MIN_VALUE || lv > Integer.MAX_VALUE) {
+                    throw new SqlParser.ParseException("Invalid " + typeBase + " value: '" + v + "' (out of INT range)");
+                }
+                return (int) lv;
+            }
+            case "BIGINT":
+                return requireIntegral(v, typeBase);
+            case "FLOAT":
+                return (float) requireDouble(v, typeBase);
+            case "DOUBLE":
+                return requireDouble(v, typeBase);
+            case "BOOLEAN", "BOOL":
+                if (v instanceof Boolean b) return b;
+                return "true".equalsIgnoreCase(v.toString()) || "1".equals(v.toString());
+            case "VARCHAR", "TEXT", "STRING":
+                return v.toString();
+            case "DATE", "DATETIME": {
+                try {
+                    return Long.parseLong(v.toString());
+                } catch (NumberFormatException e) {
+                    return v.toString();
+                }
+            }
+            default:
+                return v.toString();
+        }
+    }
+
+    private long requireIntegral(Object v, String typeBase) {
+        if (v instanceof Number n) {
+            double d = n.doubleValue();
+            if (Double.isNaN(d) || Double.isInfinite(d)) {
+                throw new SqlParser.ParseException("Invalid " + typeBase + " value: '" + v + "'");
+            }
+            return Math.round(d);
+        }
+        try {
+            return Long.parseLong(v.toString().trim());
+        } catch (NumberFormatException e) {
+            try {
+                return Math.round(Double.parseDouble(v.toString().trim()));
+            } catch (NumberFormatException e2) {
+                throw new SqlParser.ParseException("Invalid " + typeBase + " value: '" + v + "'");
+            }
+        }
+    }
+
+    private double requireDouble(Object v, String typeBase) {
+        if (v instanceof Number n) return n.doubleValue();
+        try {
+            return Double.parseDouble(v.toString().trim());
+        } catch (NumberFormatException e) {
+            throw new SqlParser.ParseException("Invalid " + typeBase + " value: '" + v + "'");
+        }
     }
 
     private Object parseValue(String raw, String dataType) {

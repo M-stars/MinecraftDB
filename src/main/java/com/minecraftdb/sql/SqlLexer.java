@@ -8,6 +8,8 @@ public class SqlLexer {
     private final String input;
     private int pos;
     private final int len;
+    /** 上一个 token 的类型，用于 '-' 负数/减号消歧（5-3 的 - 是减号，WHERE x=-1 的 -1 是负数） */
+    private TokenType lastTokenType;
 
     public SqlLexer(String input) {
         this.input = input != null ? input : "";
@@ -40,13 +42,20 @@ public class SqlLexer {
                 continue;
             }
 
-            if (Character.isDigit(c) || (c == '-' && Character.isDigit(peek(1)))) {
-                tokens.add(readNumber());
+            // 负数字面量：'-' 紧跟数字且前一个 token 不能是值结尾（否则按减号处理）
+            boolean valueEnding = lastTokenType == TokenType.NUMBER || lastTokenType == TokenType.IDENTIFIER
+                    || lastTokenType == TokenType.STRING || lastTokenType == TokenType.RPAREN;
+            if ((Character.isDigit(c) || (c == '-' && Character.isDigit(peek(1)) && !valueEnding))) {
+                Token num = readNumber();
+                tokens.add(num);
+                lastTokenType = num.type();
                 continue;
             }
 
             if (Character.isLetter(c) || c == '_') {
-                tokens.add(readIdentifierOrKeyword());
+                Token word = readIdentifierOrKeyword();
+                tokens.add(word);
+                lastTokenType = word.type();
                 continue;
             }
 
@@ -54,6 +63,7 @@ public class SqlLexer {
             Token opToken = readOperator();
             if (opToken != null) {
                 tokens.add(opToken);
+                lastTokenType = opToken.type();
                 continue;
             }
 
@@ -150,6 +160,10 @@ public class SqlLexer {
             case ';' -> { advance(); yield new Token(TokenType.SEMICOLON, ";"); }
             case '*' -> { advance(); yield new Token(TokenType.STAR, "*"); }
             case '=' -> { advance(); yield new Token(TokenType.EQUALS, "="); }
+            case '+' -> { advance(); yield new Token(TokenType.PLUS, "+"); }
+            case '-' -> { advance(); yield new Token(TokenType.MINUS, "-"); }
+            case '/' -> { advance(); yield new Token(TokenType.SLASH, "/"); }
+            case '%' -> { advance(); yield new Token(TokenType.PERCENT, "%"); }
             case '>' -> {
                 advance();
                 if (peek() == '=') { advance(); yield new Token(TokenType.GREATER_EQ, ">="); }
@@ -182,7 +196,7 @@ public class SqlLexer {
         ORDER, BY, LIMIT, OFFSET, ASC,
         IN, IS, LIKE,
         IF, EXISTS, DEFAULT, AUTO_INCREMENT,
-        GROUP, AS, DISTINCT,
+        GROUP, AS, DISTINCT, HAVING, BETWEEN, TRUNCATE,
         VARCHAR, INT, BIGINT, TEXT, BOOLEAN, FLOAT, DOUBLE, DATE, DATETIME,
 
         // Identifiers and literals
@@ -190,6 +204,7 @@ public class SqlLexer {
 
         // Operators and punctuation
         EQUALS, NOT_EQUALS, GREATER, LESS, GREATER_EQ, LESS_EQ,
+        PLUS, MINUS, SLASH, PERCENT,
         LPAREN, RPAREN, COMMA, SEMICOLON, STAR,
 
         EOF
@@ -251,6 +266,9 @@ public class SqlLexer {
             MAP.put("default", TokenType.DEFAULT);
             MAP.put("auto_increment", TokenType.AUTO_INCREMENT);
             MAP.put("group", TokenType.GROUP);
+            MAP.put("having", TokenType.HAVING);
+            MAP.put("between", TokenType.BETWEEN);
+            MAP.put("truncate", TokenType.TRUNCATE);
             MAP.put("as", TokenType.AS);
             MAP.put("distinct", TokenType.DISTINCT);
             MAP.put("desc", TokenType.DESC);

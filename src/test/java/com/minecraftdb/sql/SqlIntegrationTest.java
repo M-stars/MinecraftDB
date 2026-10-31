@@ -35,7 +35,7 @@ class SqlIntegrationTest {
         // UPDATE
         UpdateStatement update = parse("UPDATE users SET age = 26 WHERE id = 1");
         assertEquals("users", update.tableName);
-        assertEquals("26", update.assignments.get("age"));
+        assertEquals("26", update.assignments.get("age").toString());
 
         // DELETE
         DeleteStatement delete = parse("DELETE FROM users WHERE id = 1");
@@ -80,8 +80,8 @@ class SqlIntegrationTest {
     void updateMultipleFields() {
         UpdateStatement stmt = parse("UPDATE users SET name = 'Bob', age = 30 WHERE id = 2");
         assertEquals(2, stmt.assignments.size());
-        assertEquals("'Bob'", stmt.assignments.get("name"));
-        assertEquals("30", stmt.assignments.get("age"));
+        assertEquals("'Bob'", stmt.assignments.get("name").toString());
+        assertEquals("30", stmt.assignments.get("age").toString());
     }
 
     @Test

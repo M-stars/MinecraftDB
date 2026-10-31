@@ -7,16 +7,18 @@ import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * WHERE 条件树：AND/OR 优先级（NOT &gt; AND &gt; OR，与标准 SQL 一致）、
- * 括号、比较运算符、IS [NOT] NULL、[NOT] IN (...)、LIKE（% 任意串、_ 单字符）。
+ * WHERE/HAVING 条件树：AND/OR 优先级（NOT &gt; AND &gt; OR，与标准 SQL 一致）、
+ * 括号、比较运算符、IS [NOT] NULL、[NOT] IN (...)、[NOT] BETWEEN、LIKE（% 任意串、_ 单字符）。
+ *
+ * <p>条件两侧操作数为 {@link Expression}（列引用、标量函数、算术、字面量）。
+ * HAVING 复用同一棵树：列名位置代之以输出列标签（别名或聚合规范化名），
+ * 经由 {@link Resolver} 求值。
  *
  * <p>列名按大小写不敏感解析；引用不存在的列时该条件恒为 false。
  */
 public class WhereClause {
 
     private final Node root;
-    /** 首次求值时构建：小写列名 → 下标 */
-    private Map<String, Integer> columnIndex;
 
     public WhereClause(Node root) {
         this.root = root;
@@ -26,30 +28,50 @@ public class WhereClause {
         return root;
     }
 
+    /** 行求值入口：columnNames/rowValues 等长对齐，列名大小写不敏感 */
     public boolean evaluate(List<String> columnNames, List<Object> rowValues) {
-        if (columnIndex == null) {
-            columnIndex = new HashMap<>();
-            for (int i = 0; i < columnNames.size(); i++) {
-                columnIndex.putIfAbsent(columnNames.get(i).toLowerCase(Locale.ROOT), i);
-            }
-        }
-        return root.eval(new Ctx(rowValues));
+        return evaluate(resolverOf(columnNames, rowValues));
     }
 
-    private final class Ctx {
-        final List<Object> rowValues;
+    /** 通用求值入口（HAVING 按输出列、JOIN 等场景使用） */
+    public boolean evaluate(Expression.Resolver resolver) {
+        return root.eval(new Ctx(resolver));
+    }
 
-        Ctx(List<Object> rowValues) {
-            this.rowValues = rowValues;
+    public static Expression.Resolver resolverOf(List<String> columnNames, List<Object> rowValues) {
+        Map<String, Integer> idx = new HashMap<>();
+        for (int i = 0; i < columnNames.size(); i++) {
+            idx.putIfAbsent(columnNames.get(i).toLowerCase(Locale.ROOT), i);
+        }
+        return new Expression.Resolver() {
+            @Override
+            public Object value(String name) {
+                Integer i = idx.get(name.toLowerCase(Locale.ROOT));
+                return i != null && i < rowValues.size() ? rowValues.get(i) : null;
+            }
+
+            @Override
+            public boolean exists(String name) {
+                return idx.containsKey(name.toLowerCase(Locale.ROOT));
+            }
+        };
+    }
+
+    private static final class Ctx implements Expression.Resolver {
+        final Expression.Resolver delegate;
+
+        Ctx(Expression.Resolver delegate) {
+            this.delegate = delegate;
         }
 
-        int indexOf(String column) {
-            Integer idx = columnIndex.get(column.toLowerCase(Locale.ROOT));
-            return idx != null ? idx : -1;
+        @Override
+        public Object value(String name) {
+            return delegate.value(name);
         }
 
-        Object value(int idx) {
-            return idx >= 0 && idx < rowValues.size() ? rowValues.get(idx) : null;
+        @Override
+        public boolean exists(String name) {
+            return delegate.exists(name);
         }
     }
 
@@ -100,27 +122,50 @@ public class WhereClause {
         }
     }
 
-    /** 叶子基类：引用一列；列不存在时条件恒为 false */
+    /** 单操作数条件基类；操作数为 null 时条件恒为 false（unknown 语义） */
     public abstract static class Leaf extends Node {
-        final String column;
+        final Expression operand;
 
-        Leaf(String column) {
-            this.column = column;
+        Leaf(Expression operand) {
+            this.operand = operand;
+        }
+
+        /** 条件操作数（供执行器校验聚合是否出现在 WHERE/SET 等场景） */
+        public Expression getOperand() {
+            return operand;
         }
 
         Object actualOrNull(Ctx ctx) {
-            int idx = ctx.indexOf(column);
-            return idx < 0 ? null : ctx.value(idx);
+            return operand.eval(ctx);
         }
     }
 
-    /** col op value（= / != / <> / > / < / >= / <=） */
+    /** 收集条件树中引用的全部聚合调用（按规范化名去重），供 HAVING 自动补算使用 */
+    public void collectAggregateNames(java.util.Collection<String> out) {
+        collectAggregates(root, out);
+    }
+
+    private static void collectAggregates(Node node, java.util.Collection<String> out) {
+        if (node instanceof Leaf leaf) {
+            Expression.collectAggregates(leaf.operand, out);
+        } else if (node instanceof NotNode n) {
+            collectAggregates(n.inner, out);
+        } else if (node instanceof AndNode a) {
+            collectAggregates(a.left, out);
+            collectAggregates(a.right, out);
+        } else if (node instanceof OrNode o) {
+            collectAggregates(o.left, out);
+            collectAggregates(o.right, out);
+        }
+    }
+
+    /** expr op value（= / != / <> / > / < / >= / <=），value 亦可为表达式 */
     public static final class OpCondition extends Leaf {
         private final String operator;
-        private final String value;
+        private final Expression value;
 
-        public OpCondition(String column, String operator, String value) {
-            super(column);
+        public OpCondition(Expression operand, String operator, Expression value) {
+            super(operand);
             this.operator = operator;
             this.value = value;
         }
@@ -129,26 +174,27 @@ public class WhereClause {
         boolean eval(Ctx ctx) {
             Object actual = actualOrNull(ctx);
             if (actual == null) return false;
-            String actualStr = actual.toString();
+            Object expected = value.eval(ctx);
+            if (expected == null) return false;
             return switch (operator) {
-                case "=" -> actualStr.equals(unquote(value));
-                case "!=", "<>" -> !actualStr.equals(unquote(value));
-                case ">" -> compareValues(actual, unquote(value)) > 0;
-                case "<" -> compareValues(actual, unquote(value)) < 0;
-                case ">=" -> compareValues(actual, unquote(value)) >= 0;
-                case "<=" -> compareValues(actual, unquote(value)) <= 0;
+                case "=" -> compareValues(actual, expected) == 0;
+                case "!=", "<>" -> compareValues(actual, expected) != 0;
+                case ">" -> compareValues(actual, expected) > 0;
+                case "<" -> compareValues(actual, expected) < 0;
+                case ">=" -> compareValues(actual, expected) >= 0;
+                case "<=" -> compareValues(actual, expected) <= 0;
                 default -> false;
             };
         }
     }
 
-    /** col [NOT] IN (v1, v2, ...)；值为 NULL 时恒 false（与 SQL 的 unknown 语义一致） */
+    /** expr [NOT] IN (v1, v2, ...)；操作数为 NULL 时恒 false（与 SQL 的 unknown 语义一致） */
     public static final class InCondition extends Leaf {
-        private final List<String> values;
+        private final List<String> values; // 原始文本（字符串可能带引号）
         private final boolean negated;
 
-        public InCondition(String column, List<String> values, boolean negated) {
-            super(column);
+        public InCondition(Expression operand, List<String> values, boolean negated) {
+            super(operand);
             this.values = values;
             this.negated = negated;
         }
@@ -169,18 +215,18 @@ public class WhereClause {
         }
     }
 
-    /** col [NOT] LIKE pattern（% 任意长度、_ 单个字符） */
+    /** expr [NOT] LIKE pattern（% 任意长度、_ 单个字符） */
     public static final class LikeCondition extends Leaf {
         private final String pattern;
         private final boolean negated;
         private Pattern compiled;
 
-        public LikeCondition(String column, String pattern) {
-            this(column, pattern, false);
+        public LikeCondition(Expression operand, String pattern) {
+            this(operand, pattern, false);
         }
 
-        public LikeCondition(String column, String pattern, boolean negated) {
-            super(column);
+        public LikeCondition(Expression operand, String pattern, boolean negated) {
+            super(operand);
             this.pattern = pattern;
             this.negated = negated;
         }
@@ -213,39 +259,76 @@ public class WhereClause {
         }
     }
 
-    /** col IS [NOT] NULL */
-    public static final class NullCondition extends Leaf {
+    /** expr [NOT] BETWEEN low AND high（双闭区间） */
+    public static final class BetweenCondition extends Leaf {
+        private final String low;  // 原始文本
+        private final String high; // 原始文本
         private final boolean negated;
 
-        public NullCondition(String column, boolean negated) {
-            super(column);
+        public BetweenCondition(Expression operand, String low, String high, boolean negated) {
+            super(operand);
+            this.low = low;
+            this.high = high;
             this.negated = negated;
         }
 
         @Override
         boolean eval(Ctx ctx) {
-            int idx = ctx.indexOf(column);
-            if (idx < 0) return false;
-            boolean isNull = ctx.value(idx) == null;
+            Object actual = actualOrNull(ctx);
+            if (actual == null) return false;
+            Object lo = valueOf(low);
+            Object hi = valueOf(high);
+            if (lo == null || hi == null) return false;
+            boolean in = compareValues(actual, lo) >= 0 && compareValues(actual, hi) <= 0;
+            return negated ? !in : in;
+        }
+
+        private static Object valueOf(String raw) {
+            String v = unquote(raw);
+            if (v == null) return null;
+            try {
+                return Long.parseLong(v);
+            } catch (NumberFormatException e) {
+                try {
+                    return Double.parseDouble(v);
+                } catch (NumberFormatException e2) {
+                    return v;
+                }
+            }
+        }
+    }
+
+    /** expr IS [NOT] NULL；引用不存在的列时恒为 false（与其他条件一致） */
+    public static final class NullCondition extends Leaf {
+        private final boolean negated;
+
+        public NullCondition(Expression operand, boolean negated) {
+            super(operand);
+            this.negated = negated;
+        }
+
+        @Override
+        boolean eval(Ctx ctx) {
+            if (!operand.exists(ctx)) return false;
+            boolean isNull = operand.eval(ctx) == null;
             return negated ? !isNull : isNull;
         }
     }
 
     // === 求值工具 ===
 
+    /** null 与 null 相等；数值按数值比较；其余按字符串比较 */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    static int compareValues(Object a, String b) {
+    static int compareValues(Object a, Object b) {
+        if (a instanceof Number na && b instanceof Number nb) {
+            return Double.compare(na.doubleValue(), nb.doubleValue());
+        }
         try {
-            if (a instanceof Number) {
-                return Double.compare(((Number) a).doubleValue(), Double.parseDouble(b));
-            }
-            if (a instanceof Comparable) {
+            if (a instanceof Comparable && a.getClass().isInstance(b)) {
                 return ((Comparable) a).compareTo(b);
             }
-            return a.toString().compareTo(b);
-        } catch (Exception e) {
-            return 0;
-        }
+        } catch (Exception ignored) {}
+        return a.toString().compareTo(b.toString());
     }
 
     static String unquote(String s) {

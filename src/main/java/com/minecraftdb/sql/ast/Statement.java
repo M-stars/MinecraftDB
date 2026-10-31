@@ -6,6 +6,7 @@ public abstract class Statement {
         CREATE_TABLE,
         DROP_TABLE,
         ALTER_TABLE,
+        TRUNCATE_TABLE,
         INSERT,
         SELECT,
         UPDATE,

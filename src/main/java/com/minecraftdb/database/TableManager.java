@@ -177,6 +177,28 @@ public class TableManager {
         }
     }
 
+    /**
+     * TRUNCATE：清空数据列区域的全部方块并重置 nextZ=1（自增重启）。
+     * 经由 blockOp 清除，所有方块变更照常记录 WAL。调用方必须持有表写锁。
+     */
+    public void truncateTable(String tableName, List<ColumnDefinition> schema) {
+        CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
+        if (coords == null) throw new IllegalStateException("Table not found: " + tableName);
+
+        for (int colIdx = 0; colIdx < schema.size(); colIdx++) {
+            int x = coords.xStart + colIdx;
+            for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
+                for (long z = 1; z < coords.nextZ; z++) {
+                    blockOp.clearBlock(x, y, (int) z);
+                }
+            }
+        }
+        blockOp.flush();
+
+        coords.nextZ = 1;
+        dbManager.saveTableRegistry();
+    }
+
     // === Encoding/Decoding helpers ===
 
     private List<DyeColor> encodeValue(Object value, String dataType) {

@@ -115,7 +115,7 @@ class SqlParserTest {
             "UPDATE users SET age = 30 WHERE name = 'Bob'");
         assertEquals("users", stmt.tableName);
         assertTrue(stmt.assignments.containsKey("age"));
-        assertEquals("30", stmt.assignments.get("age"));
+        assertEquals("30", stmt.assignments.get("age").toString());
         assertNotNull(stmt.whereClause);
     }
 

@@ -35,6 +35,7 @@ public class SqlParser {
             case CREATE -> parseCreate();
             case DROP -> parseDrop();
             case ALTER -> parseAlter();
+            case TRUNCATE -> parseTruncate();
             case SHOW -> parseShow();
             case DESC -> parseDesc();
             case BEGIN -> parseBegin();
@@ -59,7 +60,7 @@ public class SqlParser {
         List<SelectStatement.SelectItem> items = new ArrayList<>();
         if (peek().type() == TokenType.STAR) {
             columns.add("*");
-            items.add(new SelectStatement.SelectItem(null, "*", "*"));
+            items.add(new SelectStatement.SelectItem(new Expression.Literal("*", "*"), "*"));
             advance();
         } else {
             items.add(parseSelectItem());
@@ -90,6 +91,12 @@ public class SqlParser {
             }
         }
 
+        WhereClause havingClause = null;
+        if (peek().type() == TokenType.HAVING) {
+            advance();
+            havingClause = new WhereClause(parseOrExpression());
+        }
+
         List<SelectStatement.OrderBy> orderBy = new ArrayList<>();
         if (peek().type() == TokenType.ORDER) {
             advance();
@@ -118,41 +125,18 @@ public class SqlParser {
         }
 
         expectOptional(TokenType.SEMICOLON);
-        return new SelectStatement(columns, tableName, whereClause, items, groupBy, distinct, orderBy, limit, offset);
+        return new SelectStatement(columns, tableName, whereClause, items, groupBy, havingClause,
+                distinct, orderBy, limit, offset);
     }
 
-    private static final Set<String> AGGREGATE_FUNCTIONS =
-            Set.of("COUNT", "SUM", "AVG", "MIN", "MAX");
-
     private SelectStatement.SelectItem parseSelectItem() {
-        Token first = advance();
-        String function = null;
-        String column;
-
-        if (first.type() == TokenType.IDENTIFIER && peek().type() == TokenType.LPAREN
-                && AGGREGATE_FUNCTIONS.contains(first.value().toUpperCase(Locale.ROOT))) {
-            function = first.value().toUpperCase(Locale.ROOT);
-            advance(); // LPAREN
-            if (peek().type() == TokenType.STAR) {
-                advance();
-                column = "*";
-                if (!function.equals("COUNT")) {
-                    throw new ParseException("* is only allowed in COUNT(*)");
-                }
-            } else {
-                column = parseIdentifier();
-            }
-            expect(TokenType.RPAREN);
-        } else {
-            column = tokenAsIdentifier(first);
-        }
-
-        String label = function != null ? function + "(" + column + ")" : column;
+        Expression expr = parseExpression();
+        String label = expr.sqlText();
         if (peek().type() == TokenType.AS) {
             advance();
             label = parseIdentifier();
         }
-        return new SelectStatement.SelectItem(function, column, label);
+        return new SelectStatement.SelectItem(expr, label);
     }
 
     /** 支持把数据类型关键字等用作列名的逻辑与 parseIdentifier 保持一致 */
@@ -168,7 +152,7 @@ public class SqlParser {
         String column;
         Token first = advance();
         if (first.type() == TokenType.IDENTIFIER && peek().type() == TokenType.LPAREN
-                && AGGREGATE_FUNCTIONS.contains(first.value().toUpperCase(Locale.ROOT))) {
+                && Expression.AGGREGATE_FUNCTIONS.contains(first.value().toUpperCase(Locale.ROOT))) {
             // ORDER BY COUNT(*) / SUM(price) 等，与输出列 label 对应
             String fn = first.value().toUpperCase(Locale.ROOT);
             advance(); // LPAREN
@@ -257,19 +241,15 @@ public class SqlParser {
         String tableName = parseIdentifier();
         expect(TokenType.SET);
 
-        Map<String, String> assignments = new LinkedHashMap<>();
+        Map<String, Expression> assignments = new LinkedHashMap<>();
         String col = parseIdentifier();
         expect(TokenType.EQUALS);
-        {
-            String val = parseValue();
-            assignments.put(col, val);
-        }
+        assignments.put(col, parseExpression());
         while (peek().type() == TokenType.COMMA) {
             advance();
             String c = parseIdentifier();
             expect(TokenType.EQUALS);
-            String v = parseValue();
-            assignments.put(c, v);
+            assignments.put(c, parseExpression());
         }
 
         WhereClause whereClause = null;
@@ -376,6 +356,16 @@ public class SqlParser {
         String tableName = parseIdentifier();
         expectOptional(TokenType.SEMICOLON);
         return new DropTableStatement(tableName, ifExists);
+    }
+
+    // === TRUNCATE ===
+
+    private TruncateStatement parseTruncate() {
+        expect(TokenType.TRUNCATE);
+        expectOptional(TokenType.TABLE); // TABLE 关键字可选（与 MySQL 一致）
+        String tableName = parseIdentifier();
+        expectOptional(TokenType.SEMICOLON);
+        return new TruncateStatement(tableName);
     }
 
     // === ALTER ===
@@ -497,7 +487,7 @@ public class SqlParser {
     }
 
     private WhereClause.Node parseCondition() {
-        String column = parseIdentifier();
+        Expression left = parseConditionOperand();
 
         if (peek().type() == TokenType.IS) {
             advance();
@@ -507,12 +497,20 @@ public class SqlParser {
                 advance();
             }
             expect(TokenType.NULL_KW);
-            return new WhereClause.NullCondition(column, negated);
+            return new WhereClause.NullCondition(left, negated);
         }
 
         if (peek().type() == TokenType.LIKE) {
             advance();
-            return new WhereClause.LikeCondition(column, parseValue());
+            return new WhereClause.LikeCondition(left, parseValue());
+        }
+
+        if (peek().type() == TokenType.BETWEEN) {
+            advance();
+            String low = parseValue();
+            expect(TokenType.AND);
+            String high = parseValue();
+            return new WhereClause.BetweenCondition(left, low, high, false);
         }
 
         boolean negatedIn = false;
@@ -523,16 +521,22 @@ public class SqlParser {
                 negatedIn = true;
             } else if (peek().type() == TokenType.LIKE) {
                 advance();
-                return new WhereClause.LikeCondition(column, parseValue(), true);
+                return new WhereClause.LikeCondition(left, parseValue(), true);
+            } else if (peek().type() == TokenType.BETWEEN) {
+                advance();
+                String low = parseValue();
+                expect(TokenType.AND);
+                String high = parseValue();
+                return new WhereClause.BetweenCondition(left, low, high, true);
             } else {
-                throw new ParseException("Expected IN or LIKE after NOT, got: " + peek().value());
+                throw new ParseException("Expected IN, LIKE or BETWEEN after NOT, got: " + peek().value());
             }
         } else if (peek().type() == TokenType.IN) {
             advance();
         } else {
             String operator = parseComparisonOp();
-            String value = parseValue();
-            return new WhereClause.OpCondition(column, operator, value);
+            Expression right = parseExpression();
+            return new WhereClause.OpCondition(left, operator, right);
         }
 
         expect(TokenType.LPAREN);
@@ -543,7 +547,153 @@ public class SqlParser {
             values.add(parseValue());
         }
         expect(TokenType.RPAREN);
-        return new WhereClause.InCondition(column, values, negatedIn);
+        return new WhereClause.InCondition(left, values, negatedIn);
+    }
+
+    /** 条件左侧操作数：完整表达式（列引用、函数、算术）；裸字面量无意义，直接报错 */
+    private Expression parseConditionOperand() {
+        Expression e = parseExpression();
+        if (e instanceof Expression.Literal) {
+            throw new ParseException("Expected column or function before operator, got: " + e.sqlText());
+        }
+        return e;
+    }
+
+    // === 表达式 ===
+
+    /** 加减法（优先级最低） */
+    private Expression parseExpression() {
+        Expression left = parseMultiplicative();
+        while (peek().type() == TokenType.PLUS || peek().type() == TokenType.MINUS) {
+            String op = advance().value();
+            left = new Expression.Arith(op, left, parseMultiplicative());
+        }
+        return left;
+    }
+
+    /** 乘除取模 */
+    private Expression parseMultiplicative() {
+        Expression left = parseUnary();
+        while (peek().type() == TokenType.STAR || peek().type() == TokenType.SLASH
+                || peek().type() == TokenType.PERCENT) {
+            String op = advance().value();
+            left = new Expression.Arith(op, left, parseUnary());
+        }
+        return left;
+    }
+
+    private Expression parseUnary() {
+        if (peek().type() == TokenType.MINUS) {
+            advance();
+            Token t = peek();
+            if (t.type() == TokenType.NUMBER) {
+                advance();
+                return numberLiteral("-" + t.value());
+            }
+            return new Expression.Arith("-", new Expression.Literal(0L, "0"), parseUnary());
+        }
+        if (peek().type() == TokenType.PLUS) {
+            advance();
+            return parseUnary();
+        }
+        return parsePrimary();
+    }
+
+    private Expression parsePrimary() {
+        Token t = peek();
+        switch (t.type()) {
+            case STRING:
+                advance();
+                return new Expression.Literal(t.value(), "'" + t.value() + "'");
+            case NUMBER:
+                advance();
+                return numberLiteral(t.value());
+            case NULL_KW:
+                advance();
+                return new Expression.Literal(null, "null");
+            case STAR:
+                advance();
+                return new Expression.Literal("*", "*");
+            case LPAREN: {
+                advance();
+                Expression inner = parseExpression();
+                expect(TokenType.RPAREN);
+                return inner;
+            }
+            default:
+                if (t.type() == TokenType.IDENTIFIER || isDataTypeToken(t.type())
+                        || t.type() == TokenType.INDEX || t.type() == TokenType.INDEXES
+                        || t.type() == TokenType.TABLES) {
+                    advance();
+                    // 函数调用
+                    if (peek().type() == TokenType.LPAREN) {
+                        return parseFunctionCall(t.value());
+                    }
+                    // TRUE / FALSE 布尔字面量
+                    String lower = t.value().toLowerCase(Locale.ROOT);
+                    if (lower.equals("true") || lower.equals("false")) {
+                        return new Expression.Literal(Boolean.parseBoolean(lower), t.value());
+                    }
+                    return new Expression.ColumnRef(t.value());
+                }
+                throw new ParseException("Unexpected token in expression: " + t.value() + " (" + t.type() + ")");
+        }
+    }
+
+    private Expression parseFunctionCall(String name) {
+        String fn = name.toUpperCase(Locale.ROOT);
+        if (!Expression.AGGREGATE_FUNCTIONS.contains(fn) && !Expression.SCALAR_FUNCTIONS.contains(fn)) {
+            throw new ParseException("Unknown function: " + name);
+        }
+        expect(TokenType.LPAREN);
+
+        List<Expression> args = new ArrayList<>();
+        if (peek().type() == TokenType.STAR) {
+            advance();
+            args.add(new Expression.Literal("*", "*"));
+        } else if (peek().type() != TokenType.RPAREN) {
+            args.add(parseExpression());
+            while (peek().type() == TokenType.COMMA) {
+                advance();
+                args.add(parseExpression());
+            }
+        }
+        expect(TokenType.RPAREN);
+
+        // 参数校验
+        if (Expression.AGGREGATE_FUNCTIONS.contains(fn)) {
+            if (args.size() != 1) {
+                throw new ParseException(fn + "() expects exactly one argument");
+            }
+            Expression arg = args.get(0);
+            if (arg instanceof Expression.Literal l && "*".equals(l.typed)) {
+                if (!fn.equals("COUNT")) {
+                    throw new ParseException("* is only allowed in COUNT(*)");
+                }
+            } else if (!(arg instanceof Expression.ColumnRef)) {
+                throw new ParseException("Aggregate argument must be a column name or *: " + fn);
+            }
+        } else {
+            int min = fn.equals("COALESCE") ? 1 : fn.equals("ROUND") ? 1 : 1;
+            int max = fn.equals("ROUND") ? 2 : fn.equals("COALESCE") ? Integer.MAX_VALUE : 1;
+            if (args.size() < min || args.size() > max) {
+                throw new ParseException(fn + "() expects " + (max == Integer.MAX_VALUE
+                        ? "at least " + min : min == max ? min : min + ".." + max) + " argument(s)");
+            }
+        }
+        return new Expression.Func(fn, args);
+    }
+
+    /** 数字字面量：整数 → Long，小数 → Double */
+    private Expression numberLiteral(String raw) {
+        if (raw.indexOf('.') >= 0 || raw.indexOf('e') >= 0 || raw.indexOf('E') >= 0) {
+            return new Expression.Literal(Double.parseDouble(raw), raw);
+        }
+        try {
+            return new Expression.Literal(Long.parseLong(raw), raw);
+        } catch (NumberFormatException e) {
+            return new Expression.Literal(Double.parseDouble(raw), raw);
+        }
     }
 
     // === Helpers ===
