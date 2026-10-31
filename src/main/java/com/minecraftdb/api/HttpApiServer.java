@@ -40,10 +40,12 @@ public class HttpApiServer {
         server = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
 
         // 注册路由
+        server.createContext("/", new WorkbenchHandler());
         server.createContext("/api/v1/query", new QueryHandler());
         server.createContext("/api/v1/execute", new ExecuteHandler());
         server.createContext("/api/v1/tables", new TablesHandler());
         server.createContext("/api/v1/table/", new TableHandler());
+        server.createContext("/api/v1/dump", new DumpHandler());
         server.createContext("/api/v1/health", new HealthHandler());
 
         // 守护线程池：服务器关闭时不会阻塞 JVM 退出
@@ -96,7 +98,7 @@ public class HttpApiServer {
                 handleRequest(exchange);
             } catch (PayloadTooLargeException e) {
                 try {
-                    sendJson(exchange, 413, Map.of("error", "Request body too large (max 1MB)"));
+                    sendJson(exchange, 413, Map.of("error", "Request body too large"));
                 } catch (IOException ignored) {}
             } catch (Exception e) {
                 try {
@@ -111,6 +113,64 @@ public class HttpApiServer {
     }
 
     // === 路由处理器 ===
+
+    /** 根路径：Web 查询工作台（自包含单页）。/api/* 前缀放行给 API 路由。 */
+    private class WorkbenchHandler extends BaseHandler {
+        @Override
+        protected void handleRequest(HttpExchange exchange) throws IOException {
+            String path = exchange.getRequestURI().getPath();
+            if (path.startsWith("/api/")) {
+                sendJson(exchange, 404, Map.of("error", "Not Found"));
+                return;
+            }
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendJson(exchange, 405, Map.of("error", "Method not allowed"));
+                return;
+            }
+            byte[] body = WorkbenchPage.HTML.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(body);
+            }
+        }
+    }
+
+    /** GET /api/v1/table/{name}/export?format=csv|sql 与 GET /api/v1/dump（整库 SQL） */
+    private class DumpHandler extends BaseHandler {
+        @Override
+        protected void handleRequest(HttpExchange exchange) throws IOException {
+            if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                sendJson(exchange, 405, Map.of("error", "Method not allowed"));
+                return;
+            }
+            String path = exchange.getRequestURI().getPath();
+            String sql;
+            if (path.equals("/api/v1/dump")) {
+                sql = dbManager.callOnServerThread(() -> dbManager.getDataPort().exportSqlDump(null));
+            } else if (path.startsWith("/api/v1/table/") && path.endsWith("/export")) {
+                String tableName = extractTableSegment(path, "/api/v1/table/", "/export");
+                Map<String, String> params = parseQueryParams(exchange.getRequestURI().getQuery());
+                String format = params.getOrDefault("format", "csv");
+                if ("sql".equals(format)) {
+                    sql = dbManager.callOnServerThread(() -> dbManager.getDataPort().exportSqlDump(tableName));
+                } else {
+                    sendText(exchange, 200, dbManager.callOnServerThread(
+                            () -> dbManager.getDataPort().exportCsv(tableName)), "text/csv; charset=utf-8",
+                            tableName + ".csv");
+                    return;
+                }
+            } else {
+                sendJson(exchange, 404, Map.of("error", "Not Found"));
+                return;
+            }
+            sendText(exchange, 200, sql, "application/sql; charset=utf-8", "dump.sql");
+        }
+
+        private String extractTableSegment(String path, String prefix, String suffix) {
+            return path.substring(prefix.length(), path.length() - suffix.length());
+        }
+    }
 
     /**
      * 会话 ID：客户端可用 X-MinecraftDB-Session 头在多个请求间维持同一事务；
@@ -225,8 +285,35 @@ public class HttpApiServer {
                 handleRows(exchange, tableName, limit, offset);
                 return;
             }
+            // POST /api/v1/table/{name}/import?autoCreate=true —— body 为 CSV（首行表头）
+            if (path.endsWith("/import") && "POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                String tableName = extractSegment(path, "/api/v1/table/", "/import");
+                handleImport(exchange, tableName, params);
+                return;
+            }
 
             sendJson(exchange, 404, Map.of("error", "Not Found"));
+        }
+
+        private void handleImport(HttpExchange exchange, String tableName,
+                                  Map<String, String> params) throws IOException {
+            String csv = readBody(exchange, MAX_IMPORT_BYTES);
+            if (csv == null || csv.isBlank()) {
+                sendJson(exchange, 400, Map.of("error", "Request body is empty (expect raw CSV with header row)"));
+                return;
+            }
+            boolean autoCreate = "true".equalsIgnoreCase(params.get("autoCreate"));
+            try {
+                int inserted = dbManager.callOnServerThread(
+                        () -> dbManager.getDataPort().importCsv(tableName, csv, autoCreate));
+                sendJson(exchange, 200, Map.of(
+                        "table", tableName,
+                        "inserted", inserted,
+                        "message", inserted + " row(s) imported into '" + tableName + "'"
+                ));
+            } catch (Exception e) {
+                sendJson(exchange, 400, Map.of("error", "Import failed", "message", e.getMessage()));
+            }
         }
 
         private void handleSchema(HttpExchange exchange, String tableName) throws IOException {
@@ -362,24 +449,45 @@ public class HttpApiServer {
     }
 
     private String readBody(HttpExchange exchange) throws IOException {
+        return readBody(exchange, MAX_BODY_BYTES);
+    }
+
+    private String readBody(HttpExchange exchange, int maxBytes) throws IOException {
         String lenHeader = exchange.getRequestHeaders().getFirst("Content-Length");
         if (lenHeader != null) {
             try {
-                if (Long.parseLong(lenHeader.trim()) > MAX_BODY_BYTES) {
+                if (Long.parseLong(lenHeader.trim()) > maxBytes) {
                     throw new PayloadTooLargeException();
                 }
             } catch (NumberFormatException ignored) {}
         }
         try (InputStream is = exchange.getRequestBody()) {
-            byte[] bytes = is.readNBytes(MAX_BODY_BYTES + 1);
-            if (bytes.length > MAX_BODY_BYTES) {
+            byte[] bytes = is.readNBytes(maxBytes + 1);
+            if (bytes.length > maxBytes) {
                 throw new PayloadTooLargeException();
             }
             return new String(bytes, StandardCharsets.UTF_8);
         }
     }
 
+    /** 发送文本响应（附下载文件名，浏览器访问时触发保存） */
+    private void sendText(HttpExchange exchange, int status, String text, String contentType,
+                          String downloadName) throws IOException {
+        exchange.getResponseHeaders().add("Content-Type", contentType);
+        if (downloadName != null) {
+            exchange.getResponseHeaders().add("Content-Disposition",
+                    "attachment; filename=\"" + downloadName + "\"");
+        }
+        byte[] body = text.getBytes(StandardCharsets.UTF_8);
+        exchange.sendResponseHeaders(status, body.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(body);
+        }
+    }
+
     private static final int MAX_BODY_BYTES = 1024 * 1024;
+    /** CSV 导入请求体上限 16MB */
+    private static final int MAX_IMPORT_BYTES = 16 * 1024 * 1024;
 
     private static class PayloadTooLargeException extends RuntimeException {}
 

@@ -30,6 +30,7 @@ public class DatabaseManager {
     private SchemaManager schemaManager;
     private TransactionManager transactionManager;
     private IndexManager indexManager;
+    private DataPort dataPort;
     private SqlExecutor sqlExecutor;
 
     public DatabaseManager(MinecraftServer server) {
@@ -66,6 +67,7 @@ public class DatabaseManager {
         this.transactionManager.setOnTxnCommit(txn ->
                 tableManager.getBlockOperator().commitOverlay(txn.id, txn.overlay));
         this.sqlExecutor = new SqlExecutor(this);
+        this.dataPort = new DataPort(this);
 
         // 从文件恢复表坐标注册表
         Map<String, CoordinateAllocator.TableCoords> savedCoords = schemaManager.loadTableRegistry();
@@ -217,6 +219,10 @@ public class DatabaseManager {
 
     public IndexManager getIndexManager() {
         return indexManager;
+    }
+
+    public DataPort getDataPort() {
+        return dataPort;
     }
 
     public SqlExecutor getSqlExecutor() {

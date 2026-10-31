@@ -13,6 +13,10 @@ import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.ChatFormatting;
 import net.minecraft.server.level.ServerPlayer;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
 
 public class DatabaseCommand {
@@ -40,6 +44,26 @@ public class DatabaseCommand {
                     String table = StringArgumentType.getString(ctx, "table");
                     return executeShortcut(ctx, "DESC " + table);
                 })));
+
+        // /db export <表名> [csv|sql] — 导出表到 config/minecraftdb/exports/
+        root.then(Commands.literal("export")
+            .then(Commands.argument("table", StringArgumentType.word())
+                .executes(ctx -> exportTable(ctx, StringArgumentType.getString(ctx, "table"), "csv"))
+                .then(Commands.argument("format", StringArgumentType.word())
+                    .executes(ctx -> exportTable(ctx, StringArgumentType.getString(ctx, "table"),
+                            StringArgumentType.getString(ctx, "format"))))));
+
+        // /db import <表名> <csv路径> — 从文件导入 CSV
+        root.then(Commands.literal("import")
+            .then(Commands.argument("table", StringArgumentType.word())
+                .then(Commands.argument("file", StringArgumentType.greedyString())
+                    .executes(ctx -> importTable(ctx,
+                            StringArgumentType.getString(ctx, "table"),
+                            StringArgumentType.getString(ctx, "file"))))));
+
+        // /db dump — 整库导出 SQL
+        root.then(Commands.literal("dump")
+            .executes(DatabaseCommand::dumpDatabase));
 
         // /db <SQL> — 执行任意 SQL
         root.then(Commands.argument("sql", StringArgumentType.greedyString())
@@ -108,6 +132,96 @@ public class DatabaseCommand {
 
     private static int executeShortcut(CommandContext<CommandSourceStack> ctx, String sql) {
         return executeSqlInternal(ctx.getSource(), sessionId(ctx), sql);
+    }
+
+    // === 导入 / 导出 ===
+
+    private static Path exportsDir() {
+        return Paths.get("config", "minecraftdb", "exports");
+    }
+
+    private static int exportTable(CommandContext<CommandSourceStack> ctx, String tableName, String format) {
+        DatabaseManager dbManager = MinecraftDB.getDatabaseManager();
+        if (dbManager == null) {
+            ctx.getSource().sendFailure(Component.literal("数据库尚未初始化"));
+            return 0;
+        }
+        try {
+            String content;
+            String ext;
+            if ("sql".equalsIgnoreCase(format)) {
+                content = dbManager.callOnServerThread(() -> dbManager.getDataPort().exportSqlDump(tableName));
+                ext = "sql";
+            } else if ("csv".equalsIgnoreCase(format)) {
+                content = dbManager.callOnServerThread(() -> dbManager.getDataPort().exportCsv(tableName));
+                ext = "csv";
+            } else {
+                ctx.getSource().sendFailure(Component.literal("未知格式: " + format + "（可用 csv 或 sql）"));
+                return 0;
+            }
+            Path dir = exportsDir();
+            Files.createDirectories(dir);
+            Path file = dir.resolve(tableName + "." + ext);
+            Files.writeString(file, content, StandardCharsets.UTF_8);
+            ctx.getSource().sendSuccess(() -> Component.literal(
+                    "已导出 " + (int) content.chars().filter(c -> c == '\n').count()
+                            + " 行到 " + file.toAbsolutePath()).withStyle(ChatFormatting.GREEN), false);
+            return 1;
+        } catch (Exception e) {
+            ctx.getSource().sendFailure(Component.literal("导出失败: " + e.getMessage())
+                    .withStyle(ChatFormatting.RED));
+            return 0;
+        }
+    }
+
+    private static int importTable(CommandContext<CommandSourceStack> ctx, String tableName, String fileArg) {
+        DatabaseManager dbManager = MinecraftDB.getDatabaseManager();
+        if (dbManager == null) {
+            ctx.getSource().sendFailure(Component.literal("数据库尚未初始化"));
+            return 0;
+        }
+        try {
+            Path file = Paths.get(fileArg);
+            if (!Files.exists(file)) {
+                ctx.getSource().sendFailure(Component.literal("文件不存在: " + file.toAbsolutePath())
+                        .withStyle(ChatFormatting.RED));
+                return 0;
+            }
+            String csv = Files.readString(file, StandardCharsets.UTF_8);
+            int inserted = dbManager.callOnServerThread(() -> dbManager.getDataPort().importCsv(tableName, csv, false));
+            ctx.getSource().sendSuccess(() -> Component.literal(
+                    "已从 " + file.getFileName() + " 导入 " + inserted + " 行到 '" + tableName + "'")
+                    .withStyle(ChatFormatting.GREEN), false);
+            return 1;
+        } catch (Exception e) {
+            ctx.getSource().sendFailure(Component.literal("导入失败: " + e.getMessage())
+                    .withStyle(ChatFormatting.RED));
+            return 0;
+        }
+    }
+
+    private static int dumpDatabase(CommandContext<CommandSourceStack> ctx) {
+        DatabaseManager dbManager = MinecraftDB.getDatabaseManager();
+        if (dbManager == null) {
+            ctx.getSource().sendFailure(Component.literal("数据库尚未初始化"));
+            return 0;
+        }
+        try {
+            String dump = dbManager.callOnServerThread(() -> dbManager.getDataPort().exportSqlDump(null));
+            Path dir = exportsDir();
+            Files.createDirectories(dir);
+            String stamp = java.time.LocalDateTime.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+            Path file = dir.resolve("dump-" + stamp + ".sql");
+            Files.writeString(file, dump, StandardCharsets.UTF_8);
+            ctx.getSource().sendSuccess(() -> Component.literal(
+                    "整库 dump 已写入 " + file.toAbsolutePath()).withStyle(ChatFormatting.GREEN), false);
+            return 1;
+        } catch (Exception e) {
+            ctx.getSource().sendFailure(Component.literal("dump 失败: " + e.getMessage())
+                    .withStyle(ChatFormatting.RED));
+            return 0;
+        }
     }
 
     // === SQL 执行 ===
