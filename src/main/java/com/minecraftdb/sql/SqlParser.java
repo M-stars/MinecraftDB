@@ -74,7 +74,32 @@ public class SqlParser {
         }
 
         expect(TokenType.FROM);
-        String tableName = parseIdentifier();
+        SelectStatement.TableRef mainTable = parseTableRef();
+        String tableName = mainTable.tableName();
+
+        // JOIN 链：[INNER] JOIN / LEFT [OUTER] JOIN ... ON ...
+        List<SelectStatement.JoinSpec> joins = new ArrayList<>();
+        while (peek().type() == TokenType.JOIN || peek().type() == TokenType.INNER
+                || peek().type() == TokenType.LEFT) {
+            String type;
+            if (peek().type() == TokenType.INNER) {
+                advance();
+                expect(TokenType.JOIN);
+                type = "INNER";
+            } else if (peek().type() == TokenType.LEFT) {
+                advance();
+                expectOptional(TokenType.OUTER);
+                expect(TokenType.JOIN);
+                type = "LEFT";
+            } else {
+                advance();
+                type = "INNER";
+            }
+            SelectStatement.TableRef right = parseTableRef();
+            expect(TokenType.ON);
+            WhereClause on = new WhereClause(parseOrExpression());
+            joins.add(new SelectStatement.JoinSpec(type, right, on));
+        }
 
         WhereClause whereClause = null;
         if (peek().type() == TokenType.WHERE) {
@@ -126,8 +151,21 @@ public class SqlParser {
         }
 
         expectOptional(TokenType.SEMICOLON);
-        return new SelectStatement(columns, tableName, whereClause, items, groupBy, havingClause,
-                distinct, orderBy, limit, offset);
+        return new SelectStatement(columns, tableName, mainTable, joins, whereClause, items, groupBy,
+                havingClause, distinct, orderBy, limit, offset);
+    }
+
+    /** FROM 中的表引用：表名 + 可选别名（AS alias 或裸标识符） */
+    private SelectStatement.TableRef parseTableRef() {
+        String tableName = parseIdentifier();
+        String alias = null;
+        if (peek().type() == TokenType.AS) {
+            advance();
+            alias = parseIdentifier();
+        } else if (peek().type() == TokenType.IDENTIFIER) {
+            alias = advance().value(); // 裸别名（MySQL 风格）
+        }
+        return new SelectStatement.TableRef(tableName, alias);
     }
 
     private SelectStatement.SelectItem parseSelectItem() {
@@ -641,6 +679,12 @@ public class SqlParser {
                     // 函数调用
                     if (peek().type() == TokenType.LPAREN) {
                         return parseFunctionCall(t.value());
+                    }
+                    // 限定列名 alias.column / table.column
+                    if (peek().type() == TokenType.DOT) {
+                        advance();
+                        String col = parseIdentifier();
+                        return new Expression.ColumnRef(t.value() + "." + col);
                     }
                     // TRUE / FALSE 布尔字面量
                     String lower = t.value().toLowerCase(Locale.ROOT);

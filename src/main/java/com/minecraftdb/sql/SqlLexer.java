@@ -164,6 +164,7 @@ public class SqlLexer {
             case '-' -> { advance(); yield new Token(TokenType.MINUS, "-"); }
             case '/' -> { advance(); yield new Token(TokenType.SLASH, "/"); }
             case '%' -> { advance(); yield new Token(TokenType.PERCENT, "%"); }
+            case '.' -> { advance(); yield new Token(TokenType.DOT, "."); }
             case '>' -> {
                 advance();
                 if (peek() == '=') { advance(); yield new Token(TokenType.GREATER_EQ, ">="); }
@@ -197,6 +198,7 @@ public class SqlLexer {
         IN, IS, LIKE,
         IF, EXISTS, DEFAULT, AUTO_INCREMENT,
         GROUP, AS, DISTINCT, HAVING, BETWEEN, TRUNCATE, EXPLAIN,
+        JOIN, INNER, LEFT, OUTER, DOT,
         VARCHAR, INT, BIGINT, TEXT, BOOLEAN, FLOAT, DOUBLE, DATE, DATETIME,
 
         // Identifiers and literals
@@ -270,6 +272,10 @@ public class SqlLexer {
             MAP.put("between", TokenType.BETWEEN);
             MAP.put("truncate", TokenType.TRUNCATE);
             MAP.put("explain", TokenType.EXPLAIN);
+            MAP.put("join", TokenType.JOIN);
+            MAP.put("inner", TokenType.INNER);
+            MAP.put("left", TokenType.LEFT);
+            MAP.put("outer", TokenType.OUTER);
             MAP.put("as", TokenType.AS);
             MAP.put("distinct", TokenType.DISTINCT);
             MAP.put("desc", TokenType.DESC);

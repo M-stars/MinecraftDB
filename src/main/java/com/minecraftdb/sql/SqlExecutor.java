@@ -360,15 +360,9 @@ public class SqlExecutor {
         if (!tableManager.tableExists(stmt.tableName)) {
             return QueryResult.error("Table '" + stmt.tableName + "' does not exist");
         }
-
         List<ColumnDefinition> schema = schemaManager.getSchema(stmt.tableName);
         if (schema == null) {
             return QueryResult.error("Schema not found for table '" + stmt.tableName + "'");
-        }
-
-        List<String> columnNames = new ArrayList<>();
-        for (ColumnDefinition cd : schema) {
-            columnNames.add(cd.name);
         }
 
         List<SelectStatement.SelectItem> items = stmt.selectItems;
@@ -389,19 +383,219 @@ public class SqlExecutor {
             }
         }
 
+        // 收集参与查询的全部表上下文（主表在最前，JOIN 链依序）
+        List<TableCtx> tables = new ArrayList<>();
+        tables.add(new TableCtx(stmt.mainTable, schema));
+        for (SelectStatement.JoinSpec join : stmt.joins) {
+            if (!tableManager.tableExists(join.table().tableName())) {
+                return QueryResult.error("Table '" + join.table().tableName() + "' does not exist");
+            }
+            List<ColumnDefinition> s = schemaManager.getSchema(join.table().tableName());
+            if (s == null) {
+                return QueryResult.error("Schema not found for table '" + join.table().tableName() + "'");
+            }
+            tables.add(new TableCtx(join.table(), s));
+        }
+
+        List<String> columnNames;
+        List<List<Object>> rows;
+        boolean capReached = false;
+
+        if (stmt.isJoinQuery()) {
+            JoinOutcome outcome = executeJoinPipeline(stmt, tables);
+            if (outcome.error() != null) return QueryResult.error(outcome.error());
+            columnNames = outcome.columnNames();
+            rows = outcome.rows();
+            capReached = outcome.capReached();
+        } else {
+            columnNames = new ArrayList<>();
+            for (ColumnDefinition cd : schema) columnNames.add(cd.name);
+
+            boolean aggregateMode = !stmt.groupBy.isEmpty() || stmt.havingClause != null
+                    || items.stream().anyMatch(i -> i.function() != null);
+            boolean postPaging = !stmt.orderBy.isEmpty() || aggregateMode || stmt.distinct;
+            // 无需事后处理时提前终止扫描：收集 offset+limit 个命中行即够
+            int hardCap = !postPaging && stmt.limit != null
+                    ? stmt.limit + (stmt.offset != null ? stmt.offset : 0)
+                    : ModConfig.PERFORMANCE_MAX_SELECT_ROWS;
+
+            // 流式逐行扫描：WHERE 在读取阶段求值；索引等值条件走内存索引
+            QueryPlanner.Plan plan = pickPlan(stmt.tableName, schema, stmt.whereClause);
+            rows = new ArrayList<>();
+            for (long zLong : rowSource(stmt.tableName, plan)) {
+                int z = (int) zLong;
+                Map<String, Object> row = tableManager.readRow(stmt.tableName, schema, z);
+                if (row == null || row.isEmpty()) continue;
+
+                if (stmt.whereClause != null) {
+                    List<Object> rowValues = new ArrayList<>();
+                    for (String col : columnNames) {
+                        rowValues.add(row.get(col));
+                    }
+                    if (!stmt.whereClause.evaluate(columnNames, rowValues)) continue;
+                }
+                if (rows.size() >= hardCap) {
+                    capReached = true;
+                    break;
+                }
+                List<Object> aligned = new ArrayList<>(columnNames.size());
+                for (String col : columnNames) aligned.add(row.get(col));
+                rows.add(aligned);
+            }
+        }
+
+        return finishSelect(stmt, items, columnNames, rows, capReached);
+    }
+
+    /** 参与查询的一张表：引用（含别名）+ schema */
+    private record TableCtx(SelectStatement.TableRef ref, List<ColumnDefinition> schema) {}
+
+    private record JoinOutcome(List<String> columnNames, List<List<Object>> rows,
+                               boolean capReached, String error) {}
+
+    /**
+     * JOIN 执行管线：主表全量扫描 → 逐个 JOIN（嵌套循环；等值键探测右表内存索引，
+     * LEFT 无匹配补 null 行）→ WHERE 过滤。WHERE 在 JOIN 后统一求值（标准语义），
+     * 组合行数受 PERFORMANCE_MAX_SELECT_ROWS 双重保护（JOIN 产物 + 过滤结果）。
+     */
+    private JoinOutcome executeJoinPipeline(SelectStatement stmt, List<TableCtx> tables) {
+        List<JoinNamespace.TableContext> nsTables = new ArrayList<>();
+        for (TableCtx t : tables) {
+            List<String> cols = new ArrayList<>();
+            for (ColumnDefinition cd : t.schema()) cols.add(cd.name);
+            nsTables.add(new JoinNamespace.TableContext(t.ref().qualifier(), cols));
+        }
+        JoinNamespace ns = JoinNamespace.build(nsTables);
+        int qualifiedCount = ns.qualifiedNames.size();
+
+        TableManager tm = dbManager.getTableManager();
+        IndexManager idxMgr = dbManager.getIndexManager();
+        int cap = ModConfig.PERFORMANCE_MAX_SELECT_ROWS;
+        boolean capReached = false;
+
+        // 主表全量扫描
+        TableCtx main = tables.get(0);
+        List<List<Object>> combined = new ArrayList<>();
+        long maxZ = tm.getMaxZ(main.ref().tableName());
+        for (int z = 1; z < maxZ && !capReached; z++) {
+            Map<String, Object> row = tm.readRow(main.ref().tableName(), main.schema(), z);
+            if (row == null || row.isEmpty()) continue;
+            List<Object> c = new ArrayList<>(Collections.nCopies(qualifiedCount, null));
+            fillTableSlots(c, ns.tableSlotOffsets.get(0), main.schema(), row);
+            combined.add(c);
+            if (combined.size() >= cap && tables.size() > 1) capReached = true;
+        }
+
+        // 逐个 JOIN
+        for (int j = 1; j < tables.size() && !capReached; j++) {
+            TableCtx right = tables.get(j);
+            SelectStatement.JoinSpec spec = stmt.joins.get(j - 1);
+            boolean leftJoin = "LEFT".equals(spec.type());
+            int rightOffset = ns.tableSlotOffsets.get(j);
+
+            JoinNamespace.EquiKey equi = ns.findEqui(spec.on(), j, j);
+            boolean probeIndex = equi != null && idxMgr != null
+                    && idxMgr.isIndexable(right.ref().tableName(), equi.rightColumn());
+
+            // 无索引探测路径：右表全量物化一次
+            List<List<Object>> rightRows = null;
+            if (!probeIndex) {
+                rightRows = new ArrayList<>();
+                long rMaxZ = tm.getMaxZ(right.ref().tableName());
+                for (int z = 1; z < rMaxZ; z++) {
+                    Map<String, Object> row = tm.readRow(right.ref().tableName(), right.schema(), z);
+                    if (row == null || row.isEmpty()) continue;
+                    List<Object> vals = new ArrayList<>(right.schema().size());
+                    for (ColumnDefinition cd : right.schema()) vals.add(row.get(cd.name));
+                    rightRows.add(vals);
+                }
+            }
+
+            List<List<Object>> next = new ArrayList<>();
+            for (List<Object> left : combined) {
+                boolean matched = false;
+                if (probeIndex) {
+                    Object leftVal = left.get(ns.qualifiedSlot(equi.leftName()));
+                    if (leftVal != null) {
+                        for (long z : idxMgr.lookup(right.ref().tableName(), equi.rightColumn(), leftVal)) {
+                            Map<String, Object> row = tm.readRow(right.ref().tableName(), right.schema(), (int) z);
+                            if (row == null || row.isEmpty()) continue;
+                            List<Object> candidate = copyCombined(left, qualifiedCount);
+                            fillTableSlots(candidate, rightOffset, right.schema(), row);
+                            if (spec.on().evaluate(ns.resolverFor(candidate))) {
+                                next.add(candidate);
+                                matched = true;
+                            }
+                        }
+                    }
+                } else {
+                    for (List<Object> rvals : rightRows) {
+                        List<Object> candidate = copyCombined(left, qualifiedCount);
+                        for (int i = 0; i < rvals.size(); i++) candidate.set(rightOffset + i, rvals.get(i));
+                        if (spec.on().evaluate(ns.resolverFor(candidate))) {
+                            next.add(candidate);
+                            matched = true;
+                        }
+                    }
+                }
+                if (leftJoin && !matched) {
+                    next.add(copyCombined(left, qualifiedCount)); // 右表槽位保持 null
+                }
+                if (next.size() >= cap) {
+                    capReached = true;
+                    break;
+                }
+            }
+            combined = next;
+        }
+
+        // WHERE 过滤（组合行命名空间，含裸列与限定名）
+        List<List<Object>> filtered = new ArrayList<>();
+        for (List<Object> row : combined) {
+            if (stmt.whereClause != null && !stmt.whereClause.evaluate(ns.resolverFor(row))) continue;
+            if (filtered.size() >= cap) {
+                capReached = true;
+                break;
+            }
+            filtered.add(row);
+        }
+        return new JoinOutcome(ns.columnNames, filtered, capReached, null);
+    }
+
+    private List<Object> copyCombined(List<Object> left, int qualifiedCount) {
+        List<Object> c = new ArrayList<>(left);
+        while (c.size() < qualifiedCount) c.add(null);
+        return c;
+    }
+
+    private void fillTableSlots(List<Object> c, int offset, List<ColumnDefinition> schema,
+                                Map<String, Object> row) {
+        int i = 0;
+        for (ColumnDefinition cd : schema) {
+            c.set(offset + i, row.get(cd.name));
+            i++;
+        }
+    }
+
+    /**
+     * SELECT 统一尾部管线（单表与 JOIN 共用）：ORDER BY 分类 → 列排序 →
+     * 聚合/GROUP BY/HAVING 或投影 → DISTINCT → 输出列排序 → 分页。
+     * rows 与 columnNames 按槽位对齐。
+     */
+    private QueryResult finishSelect(SelectStatement stmt, List<SelectStatement.SelectItem> items,
+                                     List<String> columnNames, List<List<Object>> rows,
+                                     boolean capReached) {
         boolean aggregateMode = !stmt.groupBy.isEmpty() || stmt.havingClause != null
                 || items.stream().anyMatch(i -> i.function() != null);
 
-        // ORDER BY 解析：优先匹配输出列（SELECT 别名 / 聚合表达式），
-        // 否则回退为表列名（允许按未出现在 SELECT 中的列排序）。
-        // 两类都存在时：先按表列排物化行，投影后再按输出列稳定排序。
+        // ORDER BY 分类：优先输出列（SELECT 别名/聚合表达式），否则表列（按未投影列排序）
         List<SelectStatement.OrderBy> labelOrderBy = new ArrayList<>();
         List<SelectStatement.OrderBy> columnOrderBy = new ArrayList<>();
         for (SelectStatement.OrderBy ob : stmt.orderBy) {
             String label = null;
             for (SelectStatement.SelectItem item : items) {
                 if (item.label().equalsIgnoreCase(ob.column())
-                        || item.column().equalsIgnoreCase(ob.column())) {
+                        || (item.column() != null && item.column().equalsIgnoreCase(ob.column()))) {
                     label = item.label();
                     break;
                 }
@@ -413,56 +607,21 @@ public class SqlExecutor {
                     return QueryResult.error("Unknown column '" + ob.column()
                             + "' in ORDER BY（聚合查询只能按输出列排序）");
                 }
-                ColumnDefinition cd = findColumn(schema, ob.column());
-                if (cd == null) {
+                if (indexOfIgnoreCase(columnNames, ob.column()) < 0) {
                     return QueryResult.error("Unknown column '" + ob.column() + "' in ORDER BY");
                 }
-                columnOrderBy.add(new SelectStatement.OrderBy(cd.name, ob.ascending()));
+                columnOrderBy.add(ob);
             }
         }
         boolean needsSort = !labelOrderBy.isEmpty() || !columnOrderBy.isEmpty();
-        boolean postPaging = needsSort || aggregateMode || stmt.distinct; // 去重/排序/聚合：先收集全部命中行，事后再处理
-        // 读取上限：显式 LIMIT 且无需事后分页时直接用作收集上限
-        int hardCap = !postPaging && stmt.limit != null
-                ? stmt.limit
-                : ModConfig.PERFORMANCE_MAX_SELECT_ROWS;
+        boolean postPaging = needsSort || aggregateMode || stmt.distinct;
 
-        // 流式逐行扫描：WHERE 在读取阶段求值，避免全量物化。
-        // 查询计划：WHERE 含 col = 常量 且列可索引时走内存索引，否则全表扫描。
-        QueryPlanner.Plan plan = pickPlan(stmt.tableName, schema, stmt.whereClause);
-        List<Map<String, Object>> collected = new ArrayList<>();
-        int matchedCount = 0;
-        boolean capReached = false;
-        for (long zLong : rowSource(stmt.tableName, plan)) {
-            int z = (int) zLong;
-            Map<String, Object> row = tableManager.readRow(stmt.tableName, schema, z);
-            if (row == null || row.isEmpty()) continue;
-
-            if (stmt.whereClause != null) {
-                List<Object> rowValues = new ArrayList<>();
-                for (String col : columnNames) {
-                    rowValues.add(row.get(col));
-                }
-                if (!stmt.whereClause.evaluate(columnNames, rowValues)) continue;
-            }
-            matchedCount++;
-
-            if (!postPaging) {
-                // 无排序无聚合：跳过 offset 个命中行，收满即提前结束扫描
-                if (stmt.offset != null && matchedCount <= stmt.offset) continue;
-            }
-            if (collected.size() >= hardCap) {
-                capReached = true;
-                break;
-            }
-            collected.add(row);
-        }
-
-        // ---- 按表列排序物化行（隐藏排序列），再投影 ----
+        // ---- 按表列排序（对齐行，隐藏排序列）----
         if (!columnOrderBy.isEmpty()) {
-            collected.sort((a, b) -> {
+            rows.sort((a, b) -> {
                 for (SelectStatement.OrderBy ob : columnOrderBy) {
-                    int cmp = compareValues(a.get(ob.column()), b.get(ob.column()));
+                    int idx = indexOfIgnoreCase(columnNames, ob.column());
+                    int cmp = compareValues(valAt(a, idx), valAt(b, idx));
                     if (cmp != 0) return ob.ascending() ? cmp : -cmp;
                 }
                 return 0;
@@ -471,17 +630,17 @@ public class SqlExecutor {
 
         String message = "Selected %d row(s)";
         List<String> outColumns;
-        List<List<Object>> rows = new ArrayList<>();
+        List<List<Object>> outRows = new ArrayList<>();
 
         if (aggregateMode) {
-            // ---- 校验 GROUP BY 列 ----
+            // ---- 解析 GROUP BY 列 ----
             Set<String> groupByResolved = new LinkedHashSet<>();
             for (String g : stmt.groupBy) {
-                ColumnDefinition cd = findColumn(schema, g);
-                if (cd == null) {
+                String resolved = resolveColumn(columnNames, g);
+                if (resolved == null) {
                     return QueryResult.error("Unknown column '" + g + "' in GROUP BY");
                 }
-                groupByResolved.add(cd.name);
+                groupByResolved.add(resolved);
             }
 
             // ---- 收集并校验聚合调用（SELECT 项 + HAVING）----
@@ -494,7 +653,7 @@ public class SqlExecutor {
             }
             for (String canonical : aggCanonicals) {
                 String[] fnArg = splitAggregateCanonical(canonical);
-                if (!"*".equals(fnArg[1]) && findColumn(schema, fnArg[1]) == null) {
+                if (!"*".equals(fnArg[1]) && resolveColumn(columnNames, fnArg[1]) == null) {
                     return QueryResult.error("Unknown column '" + fnArg[1] + "' in " + fnArg[0]);
                 }
             }
@@ -505,25 +664,26 @@ public class SqlExecutor {
                 Expression.collectBareColumns(item.expr(), bareColumns);
             }
             for (String c : bareColumns) {
-                ColumnDefinition cd = findColumn(schema, c);
-                if (cd == null) {
+                String resolved = resolveColumn(columnNames, c);
+                if (resolved == null) {
                     return QueryResult.error("Unknown column '" + c + "' in SELECT");
                 }
-                if (!groupByResolved.contains(cd.name)) {
+                if (!groupByResolved.contains(resolved)) {
                     return QueryResult.error("Column '" + c
                             + "' must appear in GROUP BY or be used in an aggregate");
                 }
             }
 
             // ---- 分组（无 GROUP BY 时整表一个组） ----
-            Map<String, List<Map<String, Object>>> groups = new LinkedHashMap<>();
+            Map<String, List<List<Object>>> groups = new LinkedHashMap<>();
             if (groupByResolved.isEmpty()) {
-                groups.put("", collected);
+                groups.put("", rows);
             } else {
-                for (Map<String, Object> row : collected) {
+                int[] gIdx = groupByResolved.stream().mapToInt(n -> indexOfIgnoreCase(columnNames, n)).toArray();
+                for (List<Object> row : rows) {
                     StringBuilder key = new StringBuilder();
-                    for (String g : groupByResolved) {
-                        key.append(String.valueOf(row.get(g))).append('\u0000');
+                    for (int idx : gIdx) {
+                        key.append(String.valueOf(valAt(row, idx))).append('\u0000');
                     }
                     groups.computeIfAbsent(key.toString(), k -> new ArrayList<>()).add(row);
                 }
@@ -533,19 +693,15 @@ public class SqlExecutor {
             for (SelectStatement.SelectItem item : items) {
                 outColumns.add(item.label());
             }
-            for (List<Map<String, Object>> groupRows : groups.values()) {
+            for (List<List<Object>> groupRows : groups.values()) {
                 // 组内聚合预计算，键为规范化名（小写）
                 Map<String, Object> aggValues = new HashMap<>();
                 for (String canonical : aggCanonicals) {
                     String[] fnArg = splitAggregateCanonical(canonical);
                     aggValues.put(canonical.toLowerCase(Locale.ROOT),
-                            computeAggregate(fnArg[0], fnArg[1], schema, groupRows));
+                            computeAggregate(fnArg[0], fnArg[1], columnNames, groupRows));
                 }
-                Map<String, Object> firstRow = groupRows.isEmpty() ? Map.of() : groupRows.get(0);
-                List<Object> firstValues = new ArrayList<>();
-                for (String col : columnNames) {
-                    firstValues.add(firstRow.get(col));
-                }
+                List<Object> firstValues = groupRows.isEmpty() ? List.of() : groupRows.get(0);
                 Expression.Resolver rowRes = WhereClause.resolverOf(columnNames, firstValues);
                 Expression.Resolver resolver = name -> {
                     String key = name.toLowerCase(Locale.ROOT);
@@ -580,24 +736,20 @@ public class SqlExecutor {
                     };
                     if (!stmt.havingClause.evaluate(havingRes)) continue;
                 }
-                rows.add(out);
+                outRows.add(out);
             }
         } else {
-            outColumns = stmt.isSelectAll() ? columnNames : stmt.columns;
-            for (Map<String, Object> row : collected) {
+            outColumns = stmt.isSelectAll() ? new ArrayList<>(columnNames) : stmt.columns;
+            for (List<Object> row : rows) {
                 if (stmt.isSelectAll()) {
-                    rows.add(new ArrayList<>(row.values()));
+                    outRows.add(new ArrayList<>(row));
                 } else {
-                    List<Object> rowValues = new ArrayList<>();
-                    for (String col : columnNames) {
-                        rowValues.add(row.get(col));
-                    }
-                    Expression.Resolver rowRes = WhereClause.resolverOf(columnNames, rowValues);
+                    Expression.Resolver rowRes = WhereClause.resolverOf(columnNames, row);
                     List<Object> projected = new ArrayList<>();
                     for (SelectStatement.SelectItem item : items) {
                         projected.add(item.expr().eval(rowRes));
                     }
-                    rows.add(projected);
+                    outRows.add(projected);
                 }
             }
         }
@@ -605,10 +757,10 @@ public class SqlExecutor {
         // ---- DISTINCT：必须在 LIMIT/OFFSET 切片之前去重（SQL 语义） ----
         if (stmt.distinct) {
             LinkedHashMap<String, List<Object>> unique = new LinkedHashMap<>();
-            for (List<Object> r : rows) {
+            for (List<Object> r : outRows) {
                 unique.putIfAbsent(r.toString(), r);
             }
-            rows = new ArrayList<>(unique.values());
+            outRows = new ArrayList<>(unique.values());
         }
 
         // ---- 按输出列排序（别名/聚合；Collections.sort 稳定，可与表列排序叠加） ----
@@ -620,7 +772,7 @@ public class SqlExecutor {
                 idxs[i] = outColumns.indexOf(ob.column());
                 ascs[i] = ob.ascending();
             }
-            rows.sort((r1, r2) -> {
+            outRows.sort((r1, r2) -> {
                 for (int i = 0; i < idxs.length; i++) {
                     int idx = idxs[i];
                     Object a = idx >= 0 && idx < r1.size() ? r1.get(idx) : null;
@@ -632,20 +784,20 @@ public class SqlExecutor {
             });
         }
 
-        // ---- 事后分页（LIMIT/OFFSET） ----
-        if (postPaging) {
-            int from = stmt.offset != null ? Math.min(stmt.offset, rows.size()) : 0;
-            int to = stmt.limit != null ? Math.min(from + stmt.limit, rows.size()) : rows.size();
-            rows = new ArrayList<>(rows.subList(from, to));
+        // ---- 分页（LIMIT/OFFSET，在去重/排序之后） ----
+        if (postPaging || stmt.limit != null || stmt.offset != null) {
+            int from = stmt.offset != null ? Math.min(stmt.offset, outRows.size()) : 0;
+            int to = stmt.limit != null ? Math.min(from + stmt.limit, outRows.size()) : outRows.size();
+            outRows = new ArrayList<>(outRows.subList(from, to));
         }
 
         if (capReached && stmt.limit == null) {
             message += "（达到 PERFORMANCE_MAX_SELECT_ROWS 上限，结果已截断）";
         }
-        QueryResult result = QueryResult.ok(String.format(message, rows.size()));
+        QueryResult result = QueryResult.ok(String.format(message, outRows.size()));
         result.setColumns(outColumns);
-        result.setRows(rows);
-        result.setRowCount(rows.size());
+        result.setRows(outRows);
+        result.setRowCount(outRows.size());
 
         return result;
     }
@@ -668,9 +820,14 @@ public class SqlExecutor {
         return () -> LongStream.range(1, maxZ).iterator();
     }
 
-    private String resolveSchemaName(List<ColumnDefinition> schema, String col) {
-        ColumnDefinition cd = findColumn(schema, col);
-        return cd != null ? cd.name : col;
+    /** 列名解析（大小写不敏感）→ 命名空间中的规范显示名；不存在返回 null */
+    private static String resolveColumn(List<String> columnNames, String name) {
+        int idx = indexOfIgnoreCase(columnNames, name);
+        return idx >= 0 ? columnNames.get(idx) : null;
+    }
+
+    private static Object valAt(List<Object> row, int idx) {
+        return idx >= 0 && idx < row.size() ? row.get(idx) : null;
     }
 
     /** 聚合规范化名拆分：COUNT(*) → [COUNT, *]，SUM(price) → [SUM, price] */
@@ -691,25 +848,25 @@ public class SqlExecutor {
     }
 
     /** 聚合计算：COUNT/SUM/AVG/MIN/MAX；SUM/AVG 只统计数值行，MIN/MAX 兼容字符串 */
-    private Object computeAggregate(String fn, String col, List<ColumnDefinition> schema,
-                                    List<Map<String, Object>> rows) {
+    private Object computeAggregate(String fn, String col, List<String> columnNames,
+                                    List<List<Object>> rows) {
         if ("COUNT".equals(fn)) {
-            if ("*".equals(col)) return rows.size();
-            String name = resolveSchemaName(schema, col);
+            if ("*".equals(col)) return (long) rows.size();
+            int idx = indexOfIgnoreCase(columnNames, col);
             long n = 0;
-            for (Map<String, Object> row : rows) {
-                if (row.get(name) != null) n++;
+            for (List<Object> row : rows) {
+                if (valAt(row, idx) != null) n++;
             }
             return n;
         }
-        String name = resolveSchemaName(schema, col);
+        int idx = indexOfIgnoreCase(columnNames, col);
         long numericCount = 0;
         double sum = 0;
         boolean allIntegral = true;
         Object min = null;
         Object max = null;
-        for (Map<String, Object> row : rows) {
-            Object v = row.get(name);
+        for (List<Object> row : rows) {
+            Object v = valAt(row, idx);
             if (v == null) continue;
             if (v instanceof Number n) {
                 numericCount++;
