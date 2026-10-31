@@ -591,6 +591,12 @@ public class SqlParser {
         }
 
         expect(TokenType.LPAREN);
+        // IN 子查询 (SELECT ...)
+        if (peek().type() == TokenType.SELECT) {
+            SelectStatement sub = parseSelect();
+            expect(TokenType.RPAREN);
+            return new WhereClause.InSubqueryCondition(left, sub, negatedIn);
+        }
         List<String> values = new ArrayList<>();
         values.add(parseValue());
         while (peek().type() == TokenType.COMMA) {
@@ -667,6 +673,12 @@ public class SqlParser {
                 return new Expression.Literal("*", "*");
             case LPAREN: {
                 advance();
+                // 标量子查询 (SELECT ...)
+                if (peek().type() == TokenType.SELECT) {
+                    SelectStatement sub = parseSelect();
+                    expect(TokenType.RPAREN);
+                    return new SubqueryExpression(sub);
+                }
                 Expression inner = parseExpression();
                 expect(TokenType.RPAREN);
                 return inner;

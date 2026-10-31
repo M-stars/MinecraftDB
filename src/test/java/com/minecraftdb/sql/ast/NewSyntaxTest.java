@@ -142,4 +142,56 @@ class NewSyntaxTest {
         assertThrows(SqlParser.ParseException.class,
                 () -> parse("SELECT SUM(*) FROM t"));
     }
+
+    // === 子查询 ===
+
+    @Test
+    @DisplayName("IN 子查询解析")
+    void inSubquery() {
+        SelectStatement stmt = (SelectStatement) parse(
+                "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)");
+        WhereClause.Node root = stmt.whereClause.getRoot();
+        assertInstanceOf(WhereClause.InSubqueryCondition.class, root);
+        WhereClause.InSubqueryCondition inq = (WhereClause.InSubqueryCondition) root;
+        assertFalse(inq.isNegated());
+        assertEquals("orders", inq.getSub().tableName);
+    }
+
+    @Test
+    @DisplayName("NOT IN 子查询解析")
+    void notInSubquery() {
+        SelectStatement stmt = (SelectStatement) parse(
+                "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM orders)");
+        WhereClause.InSubqueryCondition inq = (WhereClause.InSubqueryCondition) stmt.whereClause.getRoot();
+        assertTrue(inq.isNegated());
+    }
+
+    @Test
+    @DisplayName("标量子查询出现在比较右侧")
+    void scalarSubquery() {
+        SelectStatement stmt = (SelectStatement) parse(
+                "SELECT * FROM users WHERE score > (SELECT AVG(score) FROM users)");
+        WhereClause.OpCondition op = (WhereClause.OpCondition) stmt.whereClause.getRoot();
+        assertInstanceOf(SubqueryExpression.class, op.getValue());
+        assertEquals("users", ((SubqueryExpression) op.getValue()).sub.tableName);
+        // 子查询直接求值应抛出（必须先被解出）
+        assertThrows(IllegalStateException.class,
+                () -> op.getValue().eval(WhereClause.resolverOf(List.of(), List.of())));
+    }
+
+    @Test
+    @DisplayName("标量子查询参与算术")
+    void scalarSubqueryArith() {
+        SelectStatement stmt = (SelectStatement) parse(
+                "SELECT * FROM t WHERE score > (SELECT MAX(m) FROM m) + 10");
+        WhereClause.OpCondition op = (WhereClause.OpCondition) stmt.whereClause.getRoot();
+        assertInstanceOf(Expression.Arith.class, op.getValue());
+        Expression.Arith arith = (Expression.Arith) op.getValue();
+        assertInstanceOf(SubqueryExpression.class, arith.left);
+        assertTrue(hasSubqueryText(arith));
+    }
+
+    private boolean hasSubqueryText(Expression e) {
+        return e.sqlText().contains("(SELECT ...)");
+    }
 }

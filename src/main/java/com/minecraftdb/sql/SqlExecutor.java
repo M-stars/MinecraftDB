@@ -373,6 +373,9 @@ public class SqlExecutor {
             }
         }
 
+        // 先解出 WHERE 中的子查询（物化为值列表/字面量），再进入计划与求值
+        stmt = withResolvedWhere(stmt, resolveSubqueries(stmt.whereClause));
+
         // WHERE 中不允许聚合（标准 SQL 语义）
         if (stmt.whereClause != null) {
             Set<String> whereAggs = new LinkedHashSet<>();
@@ -452,6 +455,14 @@ public class SqlExecutor {
 
     private record JoinOutcome(List<String> columnNames, List<List<Object>> rows,
                                boolean capReached, String error) {}
+
+    /** 返回 WHERE 被替换为解出子查询版本的语句（其余字段不变） */
+    private static SelectStatement withResolvedWhere(SelectStatement stmt, WhereClause where) {
+        if (where == stmt.whereClause) return stmt;
+        return new SelectStatement(stmt.columns, stmt.tableName, stmt.mainTable, stmt.joins, where,
+                stmt.selectItems, stmt.groupBy, stmt.havingClause, stmt.distinct,
+                stmt.orderBy, stmt.limit, stmt.offset);
+    }
 
     /**
      * JOIN 执行管线：主表全量扫描 → 逐个 JOIN（嵌套循环；等值键探测右表内存索引，
@@ -802,6 +813,116 @@ public class SqlExecutor {
         return result;
     }
 
+    // === 子查询解析（非相关子查询 → 执行 → 替换为字面量/值列表） ===
+
+    /**
+     * 解出 WHERE 中的子查询：IN 子查询物化为值列表，标量子查询求值为字面量。
+     * 子查询经由完整 execute() 执行，与外层语句共享会话事务上下文。
+     * 仅支持非相关子查询（引用外层列会解析为未知列）。
+     */
+    private WhereClause resolveSubqueries(WhereClause where) {
+        if (where == null || !hasSubqueryNode(where.getRoot())) return where;
+        return new WhereClause(rebuildNode(where.getRoot()));
+    }
+
+    private WhereClause.Node rebuildNode(WhereClause.Node node) {
+        if (node instanceof WhereClause.InSubqueryCondition inq) {
+            return new WhereClause.InCondition(inq.getOperand(),
+                    executeSubqueryValues(inq.getSub()), inq.isNegated());
+        }
+        if (node instanceof WhereClause.OpCondition op) {
+            return new WhereClause.OpCondition(op.getOperand(), op.getOperator(),
+                    rebuildExpr(op.getValue()));
+        }
+        if (node instanceof WhereClause.AndNode a) {
+            return new WhereClause.AndNode(rebuildNode(a.getLeft()), rebuildNode(a.getRight()));
+        }
+        if (node instanceof WhereClause.OrNode o) {
+            return new WhereClause.OrNode(rebuildNode(o.getLeft()), rebuildNode(o.getRight()));
+        }
+        if (node instanceof WhereClause.NotNode nt) {
+            return new WhereClause.NotNode(rebuildNode(nt.getInner()));
+        }
+        return node; // Between/Like/Null/In：不含子查询
+    }
+
+    private Expression rebuildExpr(Expression e) {
+        if (e instanceof SubqueryExpression sq) {
+            Object value = executeScalarSubquery(sq.sub);
+            return new Expression.Literal(value, String.valueOf(value));
+        }
+        if (e instanceof Expression.Arith a) {
+            return new Expression.Arith(a.op, rebuildExpr(a.left), rebuildExpr(a.right));
+        }
+        if (e instanceof Expression.Func f) {
+            List<Expression> args = new ArrayList<>(f.args.size());
+            for (Expression a : f.args) args.add(rebuildExpr(a));
+            return new Expression.Func(f.name, args);
+        }
+        return e; // Literal / ColumnRef
+    }
+
+    private static boolean hasSubqueryNode(WhereClause.Node n) {
+        if (n instanceof WhereClause.InSubqueryCondition) return true;
+        if (n instanceof WhereClause.Leaf leaf) return hasSubqueryExpr(leaf.getOperand());
+        if (n instanceof WhereClause.NotNode nt) return hasSubqueryNode(nt.getInner());
+        if (n instanceof WhereClause.AndNode a) {
+            return hasSubqueryNode(a.getLeft()) || hasSubqueryNode(a.getRight());
+        }
+        if (n instanceof WhereClause.OrNode o) {
+            return hasSubqueryNode(o.getLeft()) || hasSubqueryNode(o.getRight());
+        }
+        return false;
+    }
+
+    private static boolean hasSubqueryExpr(Expression e) {
+        if (e instanceof SubqueryExpression) return true;
+        if (e instanceof Expression.Arith a) {
+            return hasSubqueryExpr(a.left) || hasSubqueryExpr(a.right);
+        }
+        if (e instanceof Expression.Func f) {
+            for (Expression a : f.args) {
+                if (hasSubqueryExpr(a)) return true;
+            }
+        }
+        return false;
+    }
+
+    /** IN 子查询 → 首列值列表（null 值剔除：IN 对 null 恒不匹配，与 SQL unknown 语义一致） */
+    private List<String> executeSubqueryValues(SelectStatement sub) {
+        QueryResult r = execute(sub);
+        if (!r.isSuccess()) {
+            throw new SqlParser.ParseException("Subquery failed: " + r.getMessage());
+        }
+        if (r.getColumns().size() != 1) {
+            throw new SqlParser.ParseException("IN subquery must return exactly one column");
+        }
+        List<String> values = new ArrayList<>();
+        for (List<Object> row : r.getRows()) {
+            Object v = row.isEmpty() ? null : row.get(0);
+            if (v == null) continue;
+            values.add(v instanceof String s ? "'" + s + "'" : v.toString());
+        }
+        return values;
+    }
+
+    /** 标量子查询 → 单值（空结果为 null；多行/多列报错，与标准 SQL 一致） */
+    private Object executeScalarSubquery(SelectStatement sub) {
+        QueryResult r = execute(sub);
+        if (!r.isSuccess()) {
+            throw new SqlParser.ParseException("Subquery failed: " + r.getMessage());
+        }
+        if (r.getColumns().size() != 1) {
+            throw new SqlParser.ParseException("Scalar subquery must return exactly one column");
+        }
+        if (r.getRows().size() > 1) {
+            throw new SqlParser.ParseException("Scalar subquery returned more than 1 row");
+        }
+        if (r.getRows().isEmpty()) return null;
+        List<Object> row = r.getRows().get(0);
+        return row.isEmpty() ? null : row.get(0);
+    }
+
     // === 查询计划 ===
 
     /** 为语句挑查询计划：索引等值查找或全表扫描（IndexManager 不可用时一律全扫描） */
@@ -948,6 +1069,9 @@ public class SqlExecutor {
             columnNames.add(cd.name);
         }
 
+        // 解出 WHERE 中的子查询（物化为值列表/字面量）
+        stmt = new UpdateStatement(stmt.tableName, stmt.assignments, resolveSubqueries(stmt.whereClause));
+
         // SET 赋值校验：列存在、不含聚合（表达式在每行求值，支持 col = col + 1）
         for (Map.Entry<String, Expression> assign : stmt.assignments.entrySet()) {
             ColumnDefinition colDef = findColumn(schema, assign.getKey());
@@ -1048,6 +1172,9 @@ public class SqlExecutor {
         for (ColumnDefinition cd : schema) {
             columnNames.add(cd.name);
         }
+
+        // 解出 WHERE 中的子查询（物化为值列表/字面量）
+        stmt = new DeleteStatement(stmt.tableName, resolveSubqueries(stmt.whereClause));
 
         boolean autoCommit = !txnManager.isInTransaction();
         if (autoCommit) txnManager.begin();

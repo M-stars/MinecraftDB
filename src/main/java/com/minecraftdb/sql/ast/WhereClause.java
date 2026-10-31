@@ -105,6 +105,10 @@ public class WhereClause {
             this.right = right;
         }
 
+        public Node getLeft() { return left; }
+
+        public Node getRight() { return right; }
+
         @Override
         boolean eval(Ctx ctx) {
             return left.eval(ctx) && right.eval(ctx);
@@ -119,6 +123,10 @@ public class WhereClause {
             this.right = right;
         }
 
+        public Node getLeft() { return left; }
+
+        public Node getRight() { return right; }
+
         @Override
         boolean eval(Ctx ctx) {
             return left.eval(ctx) || right.eval(ctx);
@@ -131,6 +139,8 @@ public class WhereClause {
         public NotNode(Node inner) {
             this.inner = inner;
         }
+
+        public Node getInner() { return inner; }
 
         @Override
         boolean eval(Ctx ctx) {
@@ -336,6 +346,34 @@ public class WhereClause {
             if (!operand.exists(ctx)) return false;
             boolean isNull = operand.eval(ctx) == null;
             return negated ? !isNull : isNull;
+        }
+    }
+
+    /**
+     * expr [NOT] IN (SELECT ...)：子查询条件。执行器在语句执行前将其物化为
+     * {@link InCondition}（值列表），此后不再参与求值——直接 eval 视为编程错误。
+     */
+    public static final class InSubqueryCondition extends Leaf {
+        private final SelectStatement sub;
+        private final boolean negated;
+
+        public InSubqueryCondition(Expression operand, SelectStatement sub, boolean negated) {
+            super(operand);
+            this.sub = sub;
+            this.negated = negated;
+        }
+
+        public SelectStatement getSub() {
+            return sub;
+        }
+
+        public boolean isNegated() {
+            return negated;
+        }
+
+        @Override
+        boolean eval(Ctx ctx) {
+            throw new IllegalStateException("IN subquery must be materialized before evaluation");
         }
     }
 
