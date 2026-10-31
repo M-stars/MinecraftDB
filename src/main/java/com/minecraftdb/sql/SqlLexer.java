@@ -196,7 +196,7 @@ public class SqlLexer {
         SHOW, TABLES, DESC, INDEX, INDEXES, ON,
         ORDER, BY, LIMIT, OFFSET, ASC,
         IN, IS, LIKE,
-        IF, EXISTS, DEFAULT, AUTO_INCREMENT,
+        IF, EXISTS, DEFAULT, AUTO_INCREMENT, UNIQUE, REFERENCES,
         GROUP, AS, DISTINCT, HAVING, BETWEEN, TRUNCATE, EXPLAIN,
         JOIN, INNER, LEFT, OUTER, DOT,
         VARCHAR, INT, BIGINT, TEXT, BOOLEAN, FLOAT, DOUBLE, DATE, DATETIME,
@@ -267,6 +267,8 @@ public class SqlLexer {
             MAP.put("exists", TokenType.EXISTS);
             MAP.put("default", TokenType.DEFAULT);
             MAP.put("auto_increment", TokenType.AUTO_INCREMENT);
+            MAP.put("unique", TokenType.UNIQUE);
+            MAP.put("references", TokenType.REFERENCES);
             MAP.put("group", TokenType.GROUP);
             MAP.put("having", TokenType.HAVING);
             MAP.put("between", TokenType.BETWEEN);

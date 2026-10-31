@@ -43,8 +43,8 @@ public class IndexManager {
     // === 可索引列 ===
 
     /**
-     * 表的可索引列 = SHOW INDEXES 元数据中的列 + 主键列 + 自增列。
-     * 主键/自增列的索引同时服务唯一性检查（替代 findDuplicateZ 的全列扫描）。
+     * 表的可索引列 = SHOW INDEXES 元数据中的列 + 主键列 + 自增列 + UNIQUE 列。
+     * 主键/自增/UNIQUE 列的索引同时服务唯一性检查（替代全列扫描）。
      */
     public Set<String> indexableColumns(String tableName) {
         Set<String> cols = new java.util.LinkedHashSet<>();
@@ -53,7 +53,7 @@ public class IndexManager {
         List<ColumnDefinition> schema = schemaManager.getSchema(tableName);
         if (schema != null) {
             for (ColumnDefinition cd : schema) {
-                if (cd.isPrimaryKey() || cd.autoIncrement) cols.add(cd.name);
+                if (cd.isPrimaryKey() || cd.autoIncrement || cd.isUnique()) cols.add(cd.name);
             }
         }
         return cols;

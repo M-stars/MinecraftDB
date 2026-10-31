@@ -11,6 +11,18 @@ public class ColumnDefinition {
     public String defaultValue;
     /** 自增列：INSERT 未提供时取现有最大值 +1，并强制唯一 */
     public boolean autoIncrement;
+    /** 外键：REFERENCES 的父表名；null 表示无外键 */
+    public String referencesTable;
+    /** 外键：父表列名；null 表示父表主键列 */
+    public String referencesColumn;
+
+    public boolean isForeignKey() {
+        return referencesTable != null;
+    }
+
+    public boolean isUnique() {
+        return hasConstraint("UNIQUE");
+    }
 
     public ColumnDefinition(String name, String dataType) {
         this.name = name;

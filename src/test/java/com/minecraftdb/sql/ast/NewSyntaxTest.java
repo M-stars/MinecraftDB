@@ -194,4 +194,60 @@ class NewSyntaxTest {
     private boolean hasSubqueryText(Expression e) {
         return e.sqlText().contains("(SELECT ...)");
     }
+
+    // === DDL 约束：复合主键 / UNIQUE / REFERENCES ===
+
+    @Test
+    @DisplayName("表级复合主键 PRIMARY KEY (a, b)")
+    void compositePrimaryKey() {
+        CreateTableStatement stmt = (CreateTableStatement) parse(
+                "CREATE TABLE order_items (order_id INT, item_id INT, qty INT, PRIMARY KEY (order_id, item_id))");
+        assertTrue(stmt.columns.get(0).isPrimaryKey());
+        assertTrue(stmt.columns.get(1).isPrimaryKey());
+        assertFalse(stmt.columns.get(2).isPrimaryKey());
+    }
+
+    @Test
+    @DisplayName("列级 UNIQUE 约束")
+    void columnUnique() {
+        CreateTableStatement stmt = (CreateTableStatement) parse(
+                "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(100) UNIQUE, name VARCHAR(50))");
+        assertTrue(stmt.columns.get(1).isUnique());
+        assertFalse(stmt.columns.get(2).isUnique());
+    }
+
+    @Test
+    @DisplayName("表级单列 UNIQUE")
+    void tableLevelUnique() {
+        CreateTableStatement stmt = (CreateTableStatement) parse(
+                "CREATE TABLE users (id INT, email VARCHAR(100), UNIQUE (email))");
+        assertTrue(stmt.columns.get(1).isUnique());
+    }
+
+    @Test
+    @DisplayName("REFERENCES 外键（显式列）")
+    void foreignKey() {
+        CreateTableStatement stmt = (CreateTableStatement) parse(
+                "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT REFERENCES users(id))");
+        assertTrue(stmt.columns.get(1).isForeignKey());
+        assertEquals("users", stmt.columns.get(1).referencesTable);
+        assertEquals("id", stmt.columns.get(1).referencesColumn);
+    }
+
+    @Test
+    @DisplayName("REFERENCES 外键（省略父列 → 父表主键）")
+    void foreignKeyDefaultParentPk() {
+        CreateTableStatement stmt = (CreateTableStatement) parse(
+                "CREATE TABLE orders (user_id INT REFERENCES users)");
+        assertTrue(stmt.columns.get(0).isForeignKey());
+        assertEquals("users", stmt.columns.get(0).referencesTable);
+        assertNull(stmt.columns.get(0).referencesColumn);
+    }
+
+    @Test
+    @DisplayName("未定义列上的表级主键报错")
+    void unknownPkColumn() {
+        assertThrows(SqlParser.ParseException.class,
+                () -> parse("CREATE TABLE t (a INT, PRIMARY KEY (b))"));
+    }
 }

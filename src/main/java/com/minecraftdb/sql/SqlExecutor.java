@@ -77,9 +77,19 @@ public class SqlExecutor {
             return QueryResult.error("Table '" + stmt.tableName + "' already exists");
         }
 
-        long pkCount = stmt.columns.stream().filter(ColumnDefinition::isPrimaryKey).count();
-        if (pkCount > 1) {
-            return QueryResult.error("Only a single PRIMARY KEY column is supported");
+        // 外键目标校验：父表存在且引用列存在（自引用除外）
+        for (ColumnDefinition cd : stmt.columns) {
+            if (!cd.isForeignKey()) continue;
+            if (cd.referencesTable.equalsIgnoreCase(stmt.tableName)) continue;
+            if (!tableManager.tableExists(cd.referencesTable)) {
+                return QueryResult.error("FOREIGN KEY target table '" + cd.referencesTable + "' does not exist");
+            }
+            List<ColumnDefinition> parentSchema = schemaManager.getSchema(cd.referencesTable);
+            String parentCol = resolveReferencesColumn(cd, parentSchema);
+            if (parentCol == null) {
+                return QueryResult.error("FOREIGN KEY column '" + cd.name + "' references '"
+                        + cd.referencesTable + "' which has no (single-column) primary key");
+            }
         }
 
         // DDL 不在事务内（与非事务性 DDL 的常规语义一致），锁在方法内自持
@@ -236,6 +246,8 @@ public class SqlExecutor {
         txnManager.acquireTableWriteLock(stmt.tableName);
 
         try {
+            List<ColumnDefinition> pkCols = columnsWithConstraint(schema, "PRIMARY KEY");
+            boolean compositePk = pkCols.size() > 1;
             int inserted = 0;
             for (List<String> valueGroup : stmt.valueRows) {
                 Map<String, Object> rowData = new LinkedHashMap<>();
@@ -250,12 +262,16 @@ public class SqlExecutor {
                         // MySQL 语义：自增列显式给 NULL 等价于未提供，生成下一个自增值
                         continue;
                     }
-                    if (parsedValue != null && (colDef.isPrimaryKey() || colDef.autoIncrement)) {
+                    // 单列唯一性：主键（复合主键改走元组检查）/自增/UNIQUE
+                    if (parsedValue != null && !(compositePk && colDef.isPrimaryKey())
+                            && (colDef.isPrimaryKey() || colDef.autoIncrement || colDef.isUnique())) {
+                        String kind = colDef.isPrimaryKey() ? "PRIMARY KEY"
+                                : colDef.autoIncrement ? "AUTO_INCREMENT" : "UNIQUE";
                         Long dup = findDuplicateZ(stmt.tableName, schema, colDef, parsedValue, -1);
                         if (dup != null) {
                             throw new IllegalStateException("Duplicate value '" + parsedValue
-                                    + "' for " + (colDef.isPrimaryKey() ? "PRIMARY KEY" : "AUTO_INCREMENT")
-                                    + " column '" + colDef.name + "' (existing row at z=" + dup + ")");
+                                    + "' for " + kind + " column '" + colDef.name
+                                    + "' (existing row at z=" + dup + ")");
                         }
                     }
                     rowData.put(colName, parsedValue);
@@ -282,6 +298,14 @@ public class SqlExecutor {
                                 + " constraint)");
                     }
                 }
+
+                // 复合主键：元组唯一性（全行扫描比对）
+                if (compositePk) {
+                    checkCompositeUnique(stmt.tableName, schema, pkCols, rowData, -1);
+                }
+
+                // 外键：引用值必须存在于父表
+                checkForeignKeysOnWrite(stmt.tableName, schema, rowData);
 
                 long z = tableManager.insertRow(stmt.tableName, schema, rowData);
                 recordIndexOp(stmt.tableName, () -> {
@@ -932,6 +956,194 @@ public class SqlExecutor {
         dbManager.getTransactionManager().recordIndexOp(table, op);
     }
 
+    // === 约束执行（复合主键 / UNIQUE / 外键） ===
+
+    private static List<ColumnDefinition> columnsWithConstraint(List<ColumnDefinition> schema, String constraint) {
+        List<ColumnDefinition> out = new ArrayList<>();
+        for (ColumnDefinition cd : schema) {
+            if (cd.hasConstraint(constraint)) out.add(cd);
+        }
+        return out;
+    }
+
+    /** 复合主键元组唯一性：扫描全表比对组合值（excludeZ 用于 UPDATE 排除本行） */
+    private void checkCompositeUnique(String tableName, List<ColumnDefinition> schema,
+                                      List<ColumnDefinition> pkCols, Map<String, Object> rowData,
+                                      long excludeZ) {
+        TableManager tm = dbManager.getTableManager();
+        long maxZ = tm.getMaxZ(tableName);
+        for (int z = 1; z < maxZ; z++) {
+            if (z == excludeZ) continue;
+            Map<String, Object> row = tm.readRow(tableName, schema, z);
+            if (row == null || row.isEmpty()) continue;
+            boolean allEqual = true;
+            for (ColumnDefinition cd : pkCols) {
+                if (!valueEquals(rowData.get(cd.name), row.get(cd.name))) {
+                    allEqual = false;
+                    break;
+                }
+            }
+            if (allEqual) {
+                StringBuilder tuple = new StringBuilder("(");
+                for (int i = 0; i < pkCols.size(); i++) {
+                    if (i > 0) tuple.append(", ");
+                    tuple.append(rowData.get(pkCols.get(i).name));
+                }
+                tuple.append(")");
+                throw new IllegalStateException("Duplicate PRIMARY KEY " + tuple
+                        + " (existing row at z=" + z + ")");
+            }
+        }
+    }
+
+    /** 外键写入校验：引用列的非空值必须存在于父表（父表列可索引时走索引预筛） */
+    private void checkForeignKeysOnWrite(String tableName, List<ColumnDefinition> schema,
+                                         Map<String, Object> data) {
+        SchemaManager schemaManager = dbManager.getSchemaManager();
+        for (ColumnDefinition cd : schema) {
+            if (!cd.isForeignKey() || !data.containsKey(cd.name)) continue;
+            Object v = data.get(cd.name);
+            if (v == null) continue; // SQL 默认 MATCH SIMPLE：NULL 引用不校验
+
+            String parentTable = cd.referencesTable;
+            List<ColumnDefinition> parentSchema = schemaManager.getSchema(parentTable);
+            if (parentSchema == null) {
+                throw new IllegalStateException("FOREIGN KEY target table '" + parentTable + "' does not exist");
+            }
+            String parentCol = resolveReferencesColumn(cd, parentSchema);
+            if (!parentHasValue(parentTable, parentSchema, parentCol, v)) {
+                throw new IllegalStateException("FOREIGN KEY constraint fails on '" + tableName + "." + cd.name
+                        + "': value " + formatValue(v) + " not found in " + parentTable + "(" + parentCol + ")");
+            }
+        }
+    }
+
+    /** 父表是否存在引用值（走行读取 + 逐值比对；父列可索引时先经索引缩小候选集） */
+    private boolean parentHasValue(String parentTable, List<ColumnDefinition> parentSchema,
+                                   String parentCol, Object value) {
+        TableManager tm = dbManager.getTableManager();
+        ColumnDefinition parentCd = findColumn(parentSchema, parentCol);
+        if (parentCd == null) return false;
+        IndexManager idx = dbManager.getIndexManager();
+        boolean txnDirty = dbManager.getTransactionManager().currentTxnWroteTable(parentTable);
+        if (idx != null && !txnDirty && idx.isIndexable(parentTable, parentCol)) {
+            for (long z : idx.lookup(parentTable, parentCol, value)) {
+                Map<String, Object> row = tm.readRow(parentTable, parentSchema, (int) z);
+                if (row != null && !row.isEmpty() && valueEquals(value, row.get(parentCd.name))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        long maxZ = tm.getMaxZ(parentTable);
+        for (int z = 1; z < maxZ; z++) {
+            Map<String, Object> row = tm.readRow(parentTable, parentSchema, z);
+            if (row == null || row.isEmpty()) continue;
+            if (valueEquals(value, row.get(parentCd.name))) return true;
+        }
+        return false;
+    }
+
+    /** 引用列解析：显式列名，或父表的单列主键 */
+    private String resolveReferencesColumn(ColumnDefinition cd, List<ColumnDefinition> parentSchema) {
+        if (cd.referencesColumn != null) return cd.referencesColumn;
+        if (parentSchema == null) return null;
+        List<ColumnDefinition> pk = columnsWithConstraint(parentSchema, "PRIMARY KEY");
+        return pk.size() == 1 ? pk.get(0).name : null;
+    }
+
+    /** 找出引用 (table, column) 的全部子表外键列 */
+    private List<Object[]> findChildReferences(String tableName, String columnName) {
+        List<Object[]> out = new ArrayList<>(); // {childTableName, childColumnDefinition}
+        SchemaManager schemaManager = dbManager.getSchemaManager();
+        for (String t : dbManager.getTableManager().listTables()) {
+            List<ColumnDefinition> s = schemaManager.getSchema(t);
+            if (s == null) continue;
+            for (ColumnDefinition cd : s) {
+                if (!cd.isForeignKey()) continue;
+                if (!cd.referencesTable.equalsIgnoreCase(tableName)) continue;
+                // 该子外键解析到的父列与被删/被改列一致（父列显式指定或默认父表主键）
+                List<ColumnDefinition> parentSchema = schemaManager.getSchema(tableName);
+                String resolvedParent = resolveReferencesColumn(cd, parentSchema);
+                String target = columnName;
+                boolean matches = resolvedParent != null
+                        ? resolvedParent.equalsIgnoreCase(target)
+                        : isSinglePrimaryKey(parentSchema, target);
+                if (matches) {
+                    out.add(new Object[]{t, cd});
+                }
+            }
+        }
+        return out;
+    }
+
+    private static boolean isSinglePrimaryKey(List<ColumnDefinition> schema, String columnName) {
+        List<ColumnDefinition> pk = columnsWithConstraint(schema, "PRIMARY KEY");
+        return pk.size() == 1 && pk.get(0).name.equalsIgnoreCase(columnName);
+    }
+
+    /** DELETE 父端限制：删除行中存在被子表引用的值 → 拒绝（RESTRICT） */
+    private void checkParentSideDelete(String tableName, Map<String, Object> row) {
+        List<ColumnDefinition> schema = dbManager.getSchemaManager().getSchema(tableName);
+        if (schema == null) return;
+        for (ColumnDefinition cd : schema) {
+            List<Object[]> children = findChildReferences(tableName, cd.name);
+            if (children.isEmpty()) continue;
+            Object v = row.get(cd.name);
+            if (v == null) continue;
+            for (Object[] child : children) {
+                String childTable = (String) child[0];
+                ColumnDefinition childCd = (ColumnDefinition) child[1];
+                if (childHasReference(childTable, childCd, v)) {
+                    throw new IllegalStateException("Cannot delete row from '" + tableName
+                            + "': value " + formatValue(v) + " of '" + cd.name
+                            + "' is still referenced by " + childTable + "(" + childCd.name + ")");
+                }
+            }
+        }
+    }
+
+    /** UPDATE 父端限制：被引用列的值变更时，旧值必须无子表行引用（RESTRICT） */
+    private void checkParentSideUpdate(String tableName, Map<String, Object> oldRow,
+                                       Map<String, Object> newValues) {
+        List<ColumnDefinition> schema = dbManager.getSchemaManager().getSchema(tableName);
+        if (schema == null) return;
+        for (ColumnDefinition cd : schema) {
+            if (!newValues.containsKey(cd.name)) continue;
+            Object oldV = oldRow.get(cd.name);
+            Object newV = newValues.get(cd.name);
+            if (oldV == null || valueEquals(oldV, newV)) continue;
+            List<Object[]> children = findChildReferences(tableName, cd.name);
+            for (Object[] child : children) {
+                String childTable = (String) child[0];
+                ColumnDefinition childCd = (ColumnDefinition) child[1];
+                if (childHasReference(childTable, childCd, oldV)) {
+                    throw new IllegalStateException("Cannot update '" + tableName + "." + cd.name
+                            + "': old value " + formatValue(oldV)
+                            + " is still referenced by " + childTable + "(" + childCd.name + ")");
+                }
+            }
+        }
+    }
+
+    /** 子表是否存在引用该值的行 */
+    private boolean childHasReference(String childTable, ColumnDefinition childCd, Object value) {
+        TableManager tm = dbManager.getTableManager();
+        List<ColumnDefinition> childSchema = dbManager.getSchemaManager().getSchema(childTable);
+        if (childSchema == null) return false;
+        long maxZ = tm.getMaxZ(childTable);
+        for (int z = 1; z < maxZ; z++) {
+            Map<String, Object> row = tm.readRow(childTable, childSchema, z);
+            if (row == null || row.isEmpty()) continue;
+            if (valueEquals(value, row.get(childCd.name))) return true;
+        }
+        return false;
+    }
+
+    private static String formatValue(Object v) {
+        return v instanceof String s ? "'" + s + "'" : String.valueOf(v);
+    }
+
     // === 查询计划 ===
 
     /** 为语句挑查询计划：索引等值查找或全表扫描（IndexManager 不可用时一律全扫描）。
@@ -1029,19 +1241,34 @@ public class SqlExecutor {
         }
 
         StringBuilder sb = new StringBuilder("CREATE TABLE ").append(stmt.tableName).append(" (\n");
+        List<ColumnDefinition> pkCols = columnsWithConstraint(schema, "PRIMARY KEY");
+        boolean compositePk = pkCols.size() > 1;
         for (int i = 0; i < schema.size(); i++) {
             ColumnDefinition cd = schema.get(i);
             sb.append("  `").append(cd.name).append("` ").append(cd.dataType);
             if (cd.autoIncrement) sb.append(" AUTO_INCREMENT");
-            if (cd.isPrimaryKey()) {
+            if (cd.isPrimaryKey() && !compositePk) {
                 sb.append(" NOT NULL PRIMARY KEY");
             } else if (!cd.isNullable()) {
                 sb.append(" NOT NULL");
+            }
+            if (cd.isUnique()) sb.append(" UNIQUE");
+            if (cd.isForeignKey()) {
+                sb.append(" REFERENCES ").append(cd.referencesTable);
+                if (cd.referencesColumn != null) sb.append("(").append(cd.referencesColumn).append(")");
             }
             if (cd.defaultValue != null) {
                 sb.append(" DEFAULT ").append(cd.defaultValue);
             }
             sb.append(i < schema.size() - 1 ? "," : "").append("\n");
+        }
+        if (compositePk) {
+            sb.append("  PRIMARY KEY (");
+            for (int i = 0; i < pkCols.size(); i++) {
+                if (i > 0) sb.append(", ");
+                sb.append("`").append(pkCols.get(i).name).append("`");
+            }
+            sb.append(")\n");
         }
         sb.append(");");
 
@@ -1106,6 +1333,8 @@ public class SqlExecutor {
         int updated = 0;
         try {
             final String updateTable = stmt.tableName;
+            List<ColumnDefinition> pkCols = columnsWithConstraint(schema, "PRIMARY KEY");
+            boolean compositePk = pkCols.size() > 1;
             QueryPlanner.Plan plan = pickPlan(stmt.tableName, schema, stmt.whereClause);
             for (long zLong : rowSource(stmt.tableName, plan)) {
                 int z = (int) zLong;
@@ -1122,7 +1351,7 @@ public class SqlExecutor {
                 }
 
                 if (matches) {
-                    // 逐列求值 SET 表达式（基于本行原值），并校验主键/自增唯一性与非空
+                    // 逐列求值 SET 表达式（基于本行原值），并校验主键/自增/UNIQUE 唯一性与非空
                     Expression.Resolver rowRes = WhereClause.resolverOf(columnNames, rowValues);
                     Map<String, Object> newValues = new LinkedHashMap<>();
                     for (Map.Entry<String, Expression> assign : stmt.assignments.entrySet()) {
@@ -1138,16 +1367,35 @@ public class SqlExecutor {
                                 throw new IllegalStateException("Column '" + cd.name
                                         + "' cannot be set to NULL (NOT NULL constraint)");
                             }
-                        } else if (cd.isPrimaryKey() || cd.autoIncrement) {
+                        } else if (!(compositePk && cd.isPrimaryKey())
+                                && (cd.isPrimaryKey() || cd.autoIncrement || cd.isUnique())) {
+                            String kind = cd.isPrimaryKey() ? "PRIMARY KEY"
+                                    : cd.autoIncrement ? "AUTO_INCREMENT" : "UNIQUE";
                             Long dup = findDuplicateZ(stmt.tableName, schema, cd, v, z);
                             if (dup != null) {
                                 throw new IllegalStateException("Duplicate value '" + v
-                                        + "' for " + (cd.isPrimaryKey() ? "PRIMARY KEY" : "AUTO_INCREMENT")
-                                        + " column '" + cd.name + "' (existing row at z=" + dup + ")");
+                                        + "' for " + kind + " column '" + cd.name
+                                        + "' (existing row at z=" + dup + ")");
                             }
                         }
                         newValues.put(cd.name, v);
                     }
+
+                    // 复合主键：任一主键列被 SET → 元组唯一性（合并后整行比对）
+                    if (compositePk) {
+                        boolean pkTouched = pkCols.stream().anyMatch(cd -> newValues.containsKey(cd.name));
+                        if (pkTouched) {
+                            Map<String, Object> merged = new LinkedHashMap<>(row);
+                            merged.putAll(newValues);
+                            checkCompositeUnique(stmt.tableName, schema, pkCols, merged, z);
+                        }
+                    }
+
+                    // 外键：SET 的引用列新值必须存在于父表
+                    checkForeignKeysOnWrite(stmt.tableName, schema, newValues);
+
+                    // 父端限制：被引用列的值变更前，须无子表行仍引用旧值（RESTRICT）
+                    checkParentSideUpdate(stmt.tableName, row, newValues);
                     // 索引维护：以「更新后的完整行」重登记值发生变化的可索引列（提交点应用）
                     Map<String, Object> merged = new LinkedHashMap<>(row);
                     merged.putAll(newValues);
@@ -1216,6 +1464,8 @@ public class SqlExecutor {
                 }
 
                 if (matches) {
+                    // 父端限制：被引用列上有子表行引用该值 → 拒绝删除（RESTRICT）
+                    checkParentSideDelete(stmt.tableName, row);
                     recordIndexOp(deleteTable, () -> {
                         IndexManager idx = dbManager.getIndexManager();
                         if (idx != null) idx.onDelete(deleteTable, z, row);

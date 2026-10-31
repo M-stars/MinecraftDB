@@ -344,18 +344,35 @@ public class SqlParser {
         columns.add(parseColumnDef());
         while (peek().type() == TokenType.COMMA) {
             advance();
-            // Check if next is a table constraint (PRIMARY KEY)
+            // 表级约束：PRIMARY KEY (col, ...) / UNIQUE (col)
             if (peek().type() == TokenType.PRIMARY) {
                 advance();
                 expect(TokenType.KEY);
                 expect(TokenType.LPAREN);
-                String pkCol = parseIdentifier();
-                expect(TokenType.RPAREN);
-                for (ColumnDefinition cd : columns) {
-                    if (cd.name.equalsIgnoreCase(pkCol)) {
-                        cd.addConstraint("PRIMARY KEY");
-                    }
+                List<String> pkCols = new ArrayList<>();
+                pkCols.add(parseIdentifier());
+                while (peek().type() == TokenType.COMMA) {
+                    advance();
+                    pkCols.add(parseIdentifier());
                 }
+                expect(TokenType.RPAREN);
+                for (String pkCol : pkCols) {
+                    ColumnDefinition cd = findColumnDef(columns, pkCol);
+                    if (cd == null) {
+                        throw new ParseException("PRIMARY KEY column '" + pkCol + "' not defined");
+                    }
+                    cd.addConstraint("PRIMARY KEY");
+                }
+            } else if (peek().type() == TokenType.UNIQUE) {
+                advance();
+                expect(TokenType.LPAREN);
+                String uCol = parseIdentifier();
+                expect(TokenType.RPAREN);
+                ColumnDefinition cd = findColumnDef(columns, uCol);
+                if (cd == null) {
+                    throw new ParseException("UNIQUE column '" + uCol + "' not defined");
+                }
+                cd.addConstraint("UNIQUE");
             } else {
                 columns.add(parseColumnDef());
             }
@@ -791,11 +808,29 @@ public class SqlParser {
             } else if (peek().type() == TokenType.DEFAULT) {
                 advance();
                 cd.setDefaultValue(parseValue());
+            } else if (peek().type() == TokenType.UNIQUE) {
+                advance();
+                cd.addConstraint("UNIQUE");
+            } else if (peek().type() == TokenType.REFERENCES) {
+                advance();
+                cd.referencesTable = parseIdentifier();
+                if (peek().type() == TokenType.LPAREN) {
+                    advance();
+                    cd.referencesColumn = parseIdentifier();
+                    expect(TokenType.RPAREN);
+                }
             } else {
                 break;
             }
         }
         return cd;
+    }
+
+    private static ColumnDefinition findColumnDef(List<ColumnDefinition> columns, String name) {
+        for (ColumnDefinition cd : columns) {
+            if (cd.name.equalsIgnoreCase(name)) return cd;
+        }
+        return null;
     }
 
     private String parseDataType() {
