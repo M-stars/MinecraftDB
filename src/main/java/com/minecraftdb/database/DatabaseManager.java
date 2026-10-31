@@ -56,8 +56,12 @@ public class DatabaseManager {
                 ModConfig.PERFORMANCE_BATCH_BLOCK_UPDATES);
         this.schemaManager = new SchemaManager(databaseLevel, coordAllocator);
         this.indexManager = new IndexManager(tableManager, schemaManager);
-        // 事务中止（回滚/会话中断）→ 方块状态回退，受影响表的内存索引整表失效
-        this.transactionManager.setOnTxnAborted(indexManager::invalidateTables);
+        // 事务中止（回滚/会话中断）：方块状态即将回退 → 受影响表的内存索引整表失效；
+        // 同时清除该事务尚未应用的方块写入，防止分 tick 排水把已回滚的数据写到世界
+        this.transactionManager.setOnTxnAborted(txn -> {
+            indexManager.invalidateTables(txn.acquiredTableWriteLocks);
+            tableManager.getBlockOperator().purgeTxn(txn.id);
+        });
         this.sqlExecutor = new SqlExecutor(this);
 
         // 从文件恢复表坐标注册表
@@ -145,6 +149,15 @@ public class DatabaseManager {
         }
         // 持久化表坐标映射
         saveTableRegistry();
+    }
+
+    /**
+     * 服务端每 tick 调用：按预算排水待应用的方块写入（DROP TABLE 等大批量清除分摊到多个 tick）。
+     */
+    public void tick() {
+        if (tableManager != null) {
+            tableManager.getBlockOperator().drain(ModConfig.PERFORMANCE_BLOCKS_PER_TICK);
+        }
     }
 
     // === Getters ===

@@ -49,6 +49,16 @@ public class MinecraftDB {
         LOGGER.info("MinecraftDB commands registered.");
     }
 
+    /**
+     * 每 tick 排水待应用的方块写入（DROP TABLE 等大批量清除分摊到多个 tick，避免卡顿）
+     */
+    @SubscribeEvent
+    public void onServerTick(net.minecraftforge.event.TickEvent.ServerTickEvent event) {
+        if (event.phase == net.minecraftforge.event.TickEvent.Phase.END && databaseManager != null) {
+            databaseManager.tick();
+        }
+    }
+
     @SubscribeEvent
     public void onServerStarting(ServerStartingEvent event) {
         databaseManager = new DatabaseManager(event.getServer());

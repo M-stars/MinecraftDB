@@ -33,6 +33,8 @@ public class ModConfig {
     // Performance
     public static int PERFORMANCE_MAX_SELECT_ROWS = 10000;
     public static boolean PERFORMANCE_BATCH_BLOCK_UPDATES = true;
+    /** 每 tick 排水的方块写入上限（0 = 关闭异步排水，flush 时同步全部应用） */
+    public static int PERFORMANCE_BLOCKS_PER_TICK = 2048;
 
     public static void loadConfig(Path path) {
         if (!Files.exists(path)) {
@@ -65,6 +67,7 @@ public class ModConfig {
             if (data.performance != null) {
                 PERFORMANCE_MAX_SELECT_ROWS = data.performance.max_select_rows;
                 PERFORMANCE_BATCH_BLOCK_UPDATES = data.performance.batch_block_updates;
+                PERFORMANCE_BLOCKS_PER_TICK = data.performance.blocks_per_tick;
             }
         } catch (IOException e) {
             saveConfig(path);
@@ -93,6 +96,7 @@ public class ModConfig {
         data.performance = new PerformanceConfig();
         data.performance.max_select_rows = PERFORMANCE_MAX_SELECT_ROWS;
         data.performance.batch_block_updates = PERFORMANCE_BATCH_BLOCK_UPDATES;
+        data.performance.blocks_per_tick = PERFORMANCE_BLOCKS_PER_TICK;
 
         try {
             Files.createDirectories(path.getParent());
@@ -133,5 +137,6 @@ public class ModConfig {
     private static class PerformanceConfig {
         int max_select_rows;
         boolean batch_block_updates;
+        int blocks_per_tick;
     }
 }

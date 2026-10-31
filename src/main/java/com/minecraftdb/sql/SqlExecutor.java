@@ -296,7 +296,6 @@ public class SqlExecutor {
             if (autoCommit) {
                 txnManager.rollback();
             }
-            tableManager.getBlockOperator().clearPending();
             return QueryResult.error("Insert failed: " + e.getMessage());
         }
     }
@@ -868,7 +867,6 @@ public class SqlExecutor {
             if (autoCommit) txnManager.commit();
         } catch (Exception e) {
             if (autoCommit) txnManager.rollback();
-            tableManager.getBlockOperator().clearPending();
             return QueryResult.error("Update failed: " + e.getMessage());
         }
 
@@ -928,7 +926,6 @@ public class SqlExecutor {
             if (autoCommit) txnManager.commit();
         } catch (Exception e) {
             if (autoCommit) txnManager.rollback();
-            tableManager.getBlockOperator().clearPending();
             return QueryResult.error("Delete failed: " + e.getMessage());
         }
 

@@ -56,8 +56,8 @@ public class TransactionManager {
     private final Map<String, ReentrantReadWriteLock> tableLocks = new ConcurrentHashMap<>();
     private final Map<String, Map<Long, ReentrantReadWriteLock>> rowLocks = new ConcurrentHashMap<>();
 
-    /** 事务中止（回滚/会话中断）回调：IndexManager 按触发的表整表失效（由 DatabaseManager 注入） */
-    private java.util.function.Consumer<Iterable<String>> onTxnAborted;
+    /** 事务中止（回滚/会话中断）回调：索引失效 + 待应用方块写入清除（由 DatabaseManager 注入） */
+    private java.util.function.Consumer<Transaction> onTxnAborted;
 
     // 会话 → 活跃事务
     private final Map<String, Transaction> activeTxns = new ConcurrentHashMap<>();
@@ -78,15 +78,21 @@ public class TransactionManager {
         return level.dimension().location().getPath();
     }
 
-    /** 由 DatabaseManager 在构造完成后注入：事务中止时使受影响的表索引失效 */
-    public void setOnTxnAborted(java.util.function.Consumer<Iterable<String>> callback) {
+    /** 由 DatabaseManager 在构造完成后注入：事务中止时使受影响的表索引失效、清除未应用的方块写入 */
+    public void setOnTxnAborted(java.util.function.Consumer<Transaction> callback) {
         this.onTxnAborted = callback;
     }
 
     private void notifyTxnAborted(Transaction txn) {
-        if (onTxnAborted != null && !txn.acquiredTableWriteLocks.isEmpty()) {
-            onTxnAborted.accept(txn.acquiredTableWriteLocks);
+        if (onTxnAborted != null) {
+            onTxnAborted.accept(txn);
         }
+    }
+
+    /** 当前会话事务 ID；无活跃事务返回 -1 */
+    public long currentTxnId() {
+        Transaction txn = currentTxn();
+        return txn != null ? txn.id : -1;
     }
 
     // === 会话绑定 ===
@@ -255,6 +261,16 @@ public class TransactionManager {
         }
     }
 
+    /** 崩溃恢复：把已提交事务的方块设置为 OP 记录的新颜色（幂等重放） */
+    private void applyEntry(WALEntry entry) {
+        BlockPos pos = new BlockPos(entry.x, entry.y, entry.z);
+        if (entry.newColor == null) {
+            level.removeBlock(pos, false);
+        } else {
+            WorldUtils.setWool(level, pos, DyeColor.valueOf(entry.newColor));
+        }
+    }
+
     private void releaseAllLocks(Transaction txn) {
         for (String table : txn.acquiredTableReadLocks) {
             ReentrantReadWriteLock lock = tableLocks.get(table);
@@ -394,9 +410,19 @@ public class TransactionManager {
                                      break;
                                  }
                              }
-                             if (!corrupt && !committed) {
-                                 for (int i = entries.size() - 1; i >= 0; i--) {
-                                     restoreEntry(entries.get(i));
+                             if (!corrupt) {
+                                 if (committed) {
+                                     // 已提交：WAL 在方块入队时记录，提交行之后才删除文件，
+                                     // 因此 COMMIT 存在时方块可能尚未应用（分 tick 排水中途崩溃）——
+                                     // 按 OP 顺序重放 newColor（幂等：已应用的写入重复设置结果不变）
+                                     for (WALEntry e : entries) {
+                                         applyEntry(e);
+                                     }
+                                 } else {
+                                     // 未提交：逆序恢复 oldColor（对未应用的方块是无害的幂等操作）
+                                     for (int i = entries.size() - 1; i >= 0; i--) {
+                                         restoreEntry(entries.get(i));
+                                     }
                                  }
                              }
                              if (corrupt) {

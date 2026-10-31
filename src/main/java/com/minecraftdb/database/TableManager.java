@@ -60,14 +60,24 @@ public class TableManager {
         blockOp.flush();
     }
 
+    /**
+     * 删除表：逻辑上立即从注册表移除（此后不可能再读到该表数据），
+     * 方块清除进入待应用日志并交给分 tick 排水——上万方块的清除不再卡顿单 tick。
+     * DROP 是 DDL（不可回滚），清除过程崩溃只会留下无引用的羊毛（无害）。
+     */
     public void dropTable(String tableName) {
         CoordinateAllocator.TableCoords coords = coordAllocator.getCoords(tableName);
         if (coords == null) return;
 
-        // Clear all blocks in the table's area
-        WorldUtils.fillAreaAir(level, coords.xStart, coords.xEnd,
-                WorldUtils.DATA_START_Y, WorldUtils.DATA_MAX_Y,
-                0, (int) Math.min(coords.nextZ, 10000));
+        int zEnd = (int) Math.min(coords.nextZ, 10000);
+        for (int x = coords.xStart; x <= coords.xEnd; x++) {
+            for (int y = WorldUtils.DATA_START_Y; y <= WorldUtils.DATA_MAX_Y; y++) {
+                for (int z = 0; z < zEnd; z++) {
+                    blockOp.clearBlock(x, y, z);
+                }
+            }
+        }
+        blockOp.flushDeferred();
 
         coordAllocator.remove(tableName);
         dbManager.saveTableRegistry();
